@@ -163,7 +163,7 @@ impl Tetra3 {
         Ok(())
     }
 
-pub fn solve_from_centroids(
+pub fn solve_from_centroids_impl(
         &mut self,
         star_centroids: &Array2<f64>,
         size: (u32, u32),
