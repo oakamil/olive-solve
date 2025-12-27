@@ -163,7 +163,7 @@ impl Tetra3 {
         Ok(())
     }
 
-pub fn solve_from_centroids_impl(
+pub fn solve_from_centroids(
         &mut self,
         star_centroids: &Array2<f64>,
         size: (u32, u32),
@@ -204,12 +204,54 @@ pub fn solve_from_centroids_impl(
             };
         }
 
-        // Filter centroids (simplified for brevity)
+        // Filter centroids (Cluster Buster)
+
+        // 1. Calculate thinning parameters
+        // Python: width * .6 * fov / np.sqrt(stars_per_fov) / fov_initial
+        let verification_limit = self.db_props.verification_stars_per_fov;
+        let separation_pixels = width as f64 * 0.6 / (verification_limit as f64).sqrt();
+
+        // 2. Perform Thinning (Cluster Buster)
+        let mut keep_for_patterns = vec![false; star_centroids.nrows()];
+
+        // Build KDTree.
+        if let Ok(tree) = KDTree::new(star_centroids) {
+            for (i, row) in star_centroids.outer_iter().enumerate() {
+                // Convert the row (ArrayView) to a slice for the KDTree query
+                if let Some(point_slice) = row.as_slice() {
+                    if let Ok((neighbor_indices, _)) = tree.query_radius(point_slice, separation_pixels) {
+                        
+                        // Check if any *already processed* neighbor is kept.
+                        let occupied = neighbor_indices.iter().any(|&idx| keep_for_patterns[idx]);
+                        
+                        if !occupied {
+                            keep_for_patterns[i] = true;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Fallback: keep all if tree construction fails
+            keep_for_patterns.fill(true);
+        }
+
+        // Collect the indices of stars to use for pattern generation
+        let mut pattern_centroids_inds: Vec<usize> = keep_for_patterns.iter()
+            .enumerate()
+            .filter_map(|(i, &keep)| if keep { Some(i) } else { None })
+            .collect();
+
+        // 3. Truncate for Verification
+        // Create the final image_centroids array used for matching/verification
         let mut image_centroids = star_centroids.clone();
-        if image_centroids.nrows() > self.db_props.verification_stars_per_fov {
-            image_centroids = image_centroids.slice(s![0..self.db_props.verification_stars_per_fov, ..]).to_owned();
+        if image_centroids.nrows() > verification_limit {
+             image_centroids = image_centroids.slice(s![0..verification_limit, ..]).to_owned();
         }
         let num_centroids = image_centroids.nrows();
+
+        // 4. Safety Filter
+        // Ensure pattern indices point to valid stars in the (potentially truncated) image_centroids
+        pattern_centroids_inds.retain(|&idx| idx < num_centroids);
 
         // Initial Undistort
         let mut image_centroids_undist = image_centroids.clone();
@@ -220,11 +262,27 @@ pub fn solve_from_centroids_impl(
         // Compute vectors (coarse)
         let image_centroid_vectors = compute_vectors(&image_centroids_undist, size, fov);
 
-        let centroid_indices: Vec<usize> = (0..num_centroids).collect();
-        let combinations = centroid_indices.into_iter().combinations(p_size);
+        // Use the thinned pattern indices for generating combinations
+        let combinations = pattern_centroids_inds.into_iter().combinations(p_size);
 
         for pattern_indices in combinations {
-            // ... (Timeout and Cancel checks omitted for brevity, same as before) ...
+            if let Some(ms) = solve_timeout {
+                if t0.elapsed().as_millis() as u64 > ms {
+                    return SolveResult { 
+                        ra: None, dec: None, roll: None, fov: None, distortion: None, 
+                        rmse: None, matches: None, prob: None, t_solve: t0.elapsed().as_secs_f64()*1000.0, 
+                        status: TIMEOUT 
+                    };
+                }
+            }
+            if self.cancelled {
+                 self.cancelled = false;
+                 return SolveResult { 
+                    ra: None, dec: None, roll: None, fov: None, distortion: None, 
+                    rmse: None, matches: None, prob: None, t_solve: t0.elapsed().as_secs_f64()*1000.0, 
+                    status: CANCELLED
+                };
+            }
 
             // 1. Extract Pattern and Calculate Edges
             let mut pattern_vectors = Array2::<f64>::zeros((p_size, 3));
