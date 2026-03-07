@@ -4,16 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ndarray-linalg = { version = "0.18", features = ["openblas-system"] }
-ndarray-npy = "0.10"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 zip = "0.6"
 itertools = "0.11"
-scirs2-stats = "0.1.0-rc.4"
-anyhow = "1.0" # For error handling
 ndarray = "0.17.1"
-scirs2-spatial = "0.1.0-rc.4"
 cedar-elements = { version = "0.1.0", path = "../cedar-server/elements" }
 async-trait = "0.1.89"
 canonical-error = "0.1.0"
@@ -24,7 +17,18 @@ tonic = "0.11"
 npyz = "0.8"
 statrs = "0.16"
 kiddo = "3.0"
+nalgebra = "0.34.1"
 
 [build-dependencies]
 prost-build = "0.12.3"
 tonic-build = "0.11"
+
+[dev-dependencies]
+tetra3_server = { path = "../tetra3_server" }
+tokio = { version = "1.0", features = ["full", "test-util"] }
+
+[profile.release]
+lto = "fat"            # Enables Link-Time Optimization across all dependency crates
+codegen-units = 1      # Compiles the whole program as a single unit for max optimization
+panic = "abort"        # Removes stack-unwinding overhead
+strip = true           # Strips debug symbols to reduce binary size and memory layout

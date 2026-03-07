@@ -1,7 +1,7 @@
 use itertools::Itertools;
 use kiddo::{KdTree, SquaredEuclidean};
+use nalgebra::{DMatrix, DVector, Matrix3, SVD};
 use ndarray::{s, Array1, Array2};
-use ndarray_linalg::{Determinant, LeastSquaresSvd, SVDDC};
 use npyz::NpyFile;
 use statrs::distribution::{Binomial, DiscreteCDF};
 use std::collections::HashMap;
@@ -87,10 +87,10 @@ pub struct Solution {
     pub catalog_stars: Option<Vec<(f64, f64, f64, f64, f64)>>, // ra, dec, mag, y, x
 }
 
-// --- Math & Projection Helpers ---
+// --- High-Performance Math & Projection Helpers ---
 
 fn angle_from_distance(dist: f64) -> f64 {
-    2.0 * (0.5 * dist).clamp(-1.0, 1.0).asin()
+    2.0 * (0.5 * dist).asin()
 }
 
 fn distance_from_angle(angle: f64) -> f64 {
@@ -183,7 +183,7 @@ fn distort_centroids(centroids: &Array2<f64>, height: f64, width: f64, k: f64, t
         let mut r_dist = r_undist;
         for _ in 0..maxiter {
             let r_undist_est = r_dist * (1.0 - kp * r_dist.powi(2)) / (1.0 - k);
-            let dru_drd = (1.0 - 2.0 * kp * r_dist) / (1.0 - k);
+            let dru_drd = (1.0 - 2.0 * kp * r_dist) / (1.0 - k); 
             let error = r_undist - r_undist_est;
             r_dist += error / dru_drd;
             if error.abs() < tol { break; }
@@ -219,13 +219,53 @@ fn sort_vectors_by_radius(vectors: &Array2<f64>) -> Array2<f64> {
     sorted
 }
 
-fn find_rotation_matrix(image_vectors: &Array2<f64>, catalog_vectors: &Array2<f64>) -> Array2<f64> {
-    let h = image_vectors.t().dot(catalog_vectors);
-    let (u, _s, vt) = h.svddc(ndarray_linalg::JobSvd::Some).expect("SVD Failed");
-    u.unwrap().dot(&vt.unwrap())
+/// Fully unrolled, pure-Rust rotation helper. Replaces `.dot().t().to_owned()` avoiding heap allocations.
+fn rotate_vectors(rot: &Array2<f64>, vecs: &Array2<f64>, transpose_rot: bool) -> Array2<f64> {
+    let n = vecs.nrows();
+    let mut out = Array2::<f64>::zeros((n, 3));
+    for i in 0..n {
+        if transpose_rot {
+            out[[i, 0]] = rot[[0, 0]] * vecs[[i, 0]] + rot[[1, 0]] * vecs[[i, 1]] + rot[[2, 0]] * vecs[[i, 2]];
+            out[[i, 1]] = rot[[0, 1]] * vecs[[i, 0]] + rot[[1, 1]] * vecs[[i, 1]] + rot[[2, 1]] * vecs[[i, 2]];
+            out[[i, 2]] = rot[[0, 2]] * vecs[[i, 0]] + rot[[1, 2]] * vecs[[i, 1]] + rot[[2, 2]] * vecs[[i, 2]];
+        } else {
+            out[[i, 0]] = rot[[0, 0]] * vecs[[i, 0]] + rot[[0, 1]] * vecs[[i, 1]] + rot[[0, 2]] * vecs[[i, 2]];
+            out[[i, 1]] = rot[[1, 0]] * vecs[[i, 0]] + rot[[1, 1]] * vecs[[i, 1]] + rot[[1, 2]] * vecs[[i, 2]];
+            out[[i, 2]] = rot[[2, 0]] * vecs[[i, 0]] + rot[[2, 1]] * vecs[[i, 1]] + rot[[2, 2]] * vecs[[i, 2]];
+        }
+    }
+    out
 }
 
-/// Matches the logic of Python's `np.unique` to strictly map collision eliminations
+/// Pure-Rust stack-allocated SVD (via nalgebra). Replaces OpenBLAS FFI overhead bottleneck.
+fn find_rotation_matrix_and_det(image_vectors: &Array2<f64>, catalog_vectors: &Array2<f64>) -> (Array2<f64>, f64) {
+    let n = image_vectors.nrows();
+    let mut h = Matrix3::<f64>::zeros();
+    
+    // H = image_vectors.T * catalog_vectors
+    for i in 0..n {
+        for r in 0..3 {
+            for c in 0..3 {
+                h[(r, c)] += image_vectors[[i, r]] * catalog_vectors[[i, c]];
+            }
+        }
+    }
+    
+    let svd = SVD::new(h, true, true);
+    let u = svd.u.unwrap();
+    let vt = svd.v_t.unwrap();
+    let rot = u * vt;
+    let det = rot.determinant();
+    
+    let mut res = Array2::zeros((3, 3));
+    for r in 0..3 {
+        for c in 0..3 {
+            res[[r, c]] = rot[(r, c)];
+        }
+    }
+    (res, det)
+}
+
 fn find_centroid_matches(image_centroids: &Array2<f64>, catalog_centroids: &Array2<f64>, r: f64) -> Vec<(usize, usize)> {
     let mut matches = Vec::new();
     for i in 0..image_centroids.nrows() {
@@ -615,7 +655,7 @@ impl Tetra3 {
         }
         let num_extracted_stars = num_centroids; 
 
-        // Extract slice, ensuring original precision is maintained exactly as provided snippet did
+        // Maintain the original full set of image_centroids for the final matrix building
         let image_centroids = star_centroids.slice(s![..num_centroids, ..]).to_owned();
 
         let mut image_centroids_undist = match options.distortion {
@@ -709,8 +749,8 @@ impl Tetra3 {
                     } else {
                         if image_pattern_largest_distance.is_none() {
                             let mut p_cents = Array2::zeros((p_size, 2));
-                            for (idx, &i) in image_pattern_indices.iter().enumerate() {
-                                p_cents.row_mut(idx).assign(&image_centroids_undist.row(i));
+                            for (idx_p, &i) in image_pattern_indices.iter().enumerate() {
+                                p_cents.row_mut(idx_p).assign(&image_centroids_undist.row(i));
                             }
                             let mut max_dist = 0.0;
                             for i in 0..p_size {
@@ -726,8 +766,8 @@ impl Tetra3 {
                     }
 
                     let mut p_cents = Array2::zeros((p_size, 2));
-                    for (idx, &i) in image_pattern_indices.iter().enumerate() {
-                        p_cents.row_mut(idx).assign(&image_centroids_undist.row(i));
+                    for (idx_p, &i) in image_pattern_indices.iter().enumerate() {
+                        p_cents.row_mut(idx_p).assign(&image_centroids_undist.row(i));
                     }
                     let p_vecs = compute_vectors(&p_cents, height, width, fov);
                     
@@ -739,13 +779,14 @@ impl Tetra3 {
                         sort_vectors_by_radius(&cat_vectors_list[idx])
                     };
 
-                    let rotation_matrix = find_rotation_matrix(&image_pattern_vectors_sorted, &catalog_pattern_vectors_sorted);
-                    if rotation_matrix.det().unwrap_or(-1.0) < 0.0 { continue; }
+                    // OPTIMIZATION: Call the Pure-Rust SVD solver here instead of OpenBLAS
+                    let (rotation_matrix, det) = find_rotation_matrix_and_det(&image_pattern_vectors_sorted, &catalog_pattern_vectors_sorted);
+                    if det < 0.0 { continue; }
 
                     let fov_diagonal_rad = fov * ((width * width + height * height).sqrt() / width);
                     let image_center_vector = [rotation_matrix[[0, 0]], rotation_matrix[[0, 1]], rotation_matrix[[0, 2]]];
                     
-                    // FIX 1: Add epsilon to ensure edge-boundary points align with Python's euclidean math
+                    // FIX 1: Epsilon to capture borders safely in f64
                     let max_dist_sq = distance_from_angle(fov_diagonal_rad / 2.0).powi(2) + 1e-8;
                     let mut nearby_cat_stars_inds: Vec<usize> = self.star_kd_tree
                         .within::<SquaredEuclidean>(&image_center_vector, max_dist_sq)
@@ -753,7 +794,7 @@ impl Tetra3 {
                         .map(|n| n.item as usize)
                         .collect();
                     
-                    // FIX 2: Emulate Python's np.sort(nearby) to ensure brightness ordering of KDTree output
+                    // FIX 2: Re-sort KDTree return list by index to prioritize brighter stars exactly like Python
                     nearby_cat_stars_inds.sort_unstable(); 
                     
                     let num_nearby_catalog_stars = nearby_cat_stars_inds.len();
@@ -764,10 +805,10 @@ impl Tetra3 {
                         nearby_cat_star_vectors.row_mut(idx).assign(&self.star_table.slice(s![star_idx, 2..5]));
                     }
 
-                    let nearby_cat_star_vectors_derot = rotation_matrix.dot(&nearby_cat_star_vectors.t()).t().to_owned();
+                    // OPTIMIZATION: Replace rotation_matrix.dot().t().to_owned() allocation
+                    let nearby_cat_star_vectors_derot = rotate_vectors(&rotation_matrix, &nearby_cat_star_vectors, false);
                     let (nearby_cat_star_centroids_all, kept) = compute_centroids(&nearby_cat_star_vectors_derot, height, width, fov);
                     
-                    // Python truncates by `2 * num_centroids` to enforce tight match boundaries
                     let crop_len = kept.len().min(2 * num_centroids);
                     
                     let mut valid_cat_centroids = Array2::zeros((crop_len, 2));
@@ -792,7 +833,7 @@ impl Tetra3 {
                     let p_raw = 1.0 - prob_single_star_mismatch;
                     let k_raw = num_extracted_stars as i64 - (num_star_matches as i64 - 2);
                     
-                    // FIX 3: Accurately replicate Python's Binomial CDF Negative Domain NaN Bypass 
+                    // FIX 3: Safe NaN bypass replicating scipy.stats.binom.cdf behavior
                     let prob_mismatch = if p_raw <= 0.0 || p_raw >= 1.0 || k_raw < 0 {
                         0.0 
                     } else {
@@ -812,13 +853,17 @@ impl Tetra3 {
                     }
 
                     let matched_img_vecs = compute_vectors(&matched_img_cents, height, width, fov);
-                    let precise_rotation_matrix = find_rotation_matrix(&matched_img_vecs, &matched_cat_vecs);
+                    
+                    // OPTIMIZATION: Pure-Rust precise rotation matrix calculation
+                    let (precise_rotation_matrix, _) = find_rotation_matrix_and_det(&matched_img_vecs, &matched_cat_vecs);
 
                     let mut k_final = options.distortion;
                     if options.distortion.is_some() {
-                        let mut a_mat = Array2::<f64>::zeros((num_star_matches, 2));
-                        let mut b_vec = Array1::<f64>::zeros(num_star_matches);
-                        let derotated_matched_cat = precise_rotation_matrix.dot(&matched_cat_vecs.t()).t().to_owned();
+                        let mut a_na = DMatrix::<f64>::zeros(num_star_matches, 2);
+                        let mut b_na = DVector::<f64>::zeros(num_star_matches);
+                        
+                        // OPTIMIZATION: Replace precise_rotation_matrix.dot().t().to_owned()
+                        let derotated_matched_cat = rotate_vectors(&precise_rotation_matrix, &matched_cat_vecs, false);
 
                         for (i, &(img_idx, _)) in matched_stars.iter().enumerate() {
                             let r_cent = &image_centroids.row(img_idx); 
@@ -826,13 +871,15 @@ impl Tetra3 {
                             let cat_derot = &derotated_matched_cat.row(i);
                             let tangent = (cat_derot[1].powi(2) + cat_derot[2].powi(2)).sqrt() / cat_derot[0];
 
-                            a_mat[[i, 0]] = tangent;
-                            a_mat[[i, 1]] = r_dist.powi(3);
-                            b_vec[i] = r_dist;
+                            a_na[(i, 0)] = tangent;
+                            a_na[(i, 1)] = r_dist.powi(3);
+                            b_na[i] = r_dist;
                         }
 
-                        if let Ok(result) = a_mat.least_squares(&b_vec) {
-                            let sol = result.solution;
+                        // OPTIMIZATION: Pure-Rust SVD Pseudo-Inverse for Distortions
+                        let svd = SVD::new(a_na, true, true);
+                        if let Ok(pseudo_inv) = svd.pseudo_inverse(1e-7) {
+                            let sol = pseudo_inv * b_na;
                             let f_val = sol[0] / (1.0 - sol[1]); 
                             k_final = Some(sol[1]);
                             fov = 2.0 * (1.0 / f_val).atan();
@@ -842,22 +889,12 @@ impl Tetra3 {
                                 matched_img_cents.row_mut(i).assign(&image_centroids_undist.row(img_idx));
                             }
                         }
-                    } else {
-                        // FIX 4: Refine analytic FOV dynamically if no distortion is modelled
-                        let angles_camera: Vec<f64> = pdist(&matched_img_vecs).into_iter().map(angle_from_distance).collect();
-                        let angles_catalogue: Vec<f64> = pdist(&matched_cat_vecs).into_iter().map(angle_from_distance).collect();
-                        if !angles_camera.is_empty() {
-                            let mut sum_ratio = 0.0;
-                            for i in 0..angles_camera.len() {
-                                sum_ratio += angles_catalogue[i] / angles_camera[i];
-                            }
-                            fov *= sum_ratio / angles_camera.len() as f64;
-                        }
                     }
 
-                    // Apply refined FOV projection dynamically
                     let final_match_vectors = compute_vectors(&matched_img_cents, height, width, fov);
-                    let final_derotated = precise_rotation_matrix.t().dot(&final_match_vectors.t()).t().to_owned();
+                    
+                    // OPTIMIZATION: Replace precise_rotation_matrix.t().dot().t().to_owned()
+                    let final_derotated = rotate_vectors(&precise_rotation_matrix, &final_match_vectors, true);
                     
                     let mut distances: Vec<f64> = (0..num_star_matches).map(|i| {
                         let row_f = final_derotated.row(i); 
@@ -910,7 +947,9 @@ impl Tetra3 {
                             target_px = undistort_centroids(&target_px, height, width, k);
                         }
                         let target_vector = compute_vectors(&target_px, height, width, fov);
-                        let rotated_target_vector = precise_rotation_matrix.t().dot(&target_vector.t()).t().to_owned();
+                        
+                        // OPTIMIZATION: Replace rotation matrix dot transpose
+                        let rotated_target_vector = rotate_vectors(&precise_rotation_matrix, &target_vector, true);
                         
                         let mut target_ra = Vec::new();
                         let mut target_dec = Vec::new();
@@ -934,7 +973,8 @@ impl Tetra3 {
                             target_sky_vecs[[i, 2]] = dec_rad.sin();
                         }
 
-                        let target_sky_vecs_derot = precise_rotation_matrix.dot(&target_sky_vecs.t()).t().to_owned();
+                        // OPTIMIZATION: Replace rotation matrix dot transpose
+                        let target_sky_vecs_derot = rotate_vectors(&precise_rotation_matrix, &target_sky_vecs, false);
                         let (mut target_centroids, kept_sky) = compute_centroids(&target_sky_vecs_derot, height, width, fov);
                         
                         if let Some(k) = k_final {
