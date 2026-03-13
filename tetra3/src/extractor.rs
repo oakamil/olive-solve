@@ -307,7 +307,7 @@ impl TetraExtractor {
 
     /// Extract spot centroids from an image and calculate statistics.
     pub fn extract(&mut self, input_image: &Array2<f32>) -> ExtractionResult {
-        // 2. Crop and downsample
+        // 1. Crop and downsample
         // Note: Cropping is applied before downsampling.
         let (full_height, full_width) = input_image.dim();
 
@@ -374,7 +374,7 @@ impl TetraExtractor {
             Some(Array2::from_shape_vec((height, width), self.image_vec.clone()).unwrap()) 
         } else { None };
 
-        // 3. Subtract background
+        // 2. Subtract background
         // Fused background subtraction + RMS calculation (Evaluated as an expression)
         let sum_sq_global: f64 = if let Some(mode) = self.config.bg_sub_mode {
             match mode {
@@ -505,7 +505,7 @@ impl TetraExtractor {
             Some(Array2::from_shape_vec((height, width), self.image_vec.clone()).unwrap()) 
         } else { None };
 
-        // 4. Find noise standard deviation to threshold
+        // 3. Find noise standard deviation to threshold
         enum Threshold<'a> {
             Scalar(f32),
             Array(&'a [f32]),
@@ -546,7 +546,7 @@ impl TetraExtractor {
             }
         };
 
-        // 5. Threshold to find binary mask
+        // 4. Threshold to find binary mask
         // Fused Fast Extraction: Evaluates Threshold + Binary Erosion (3x3 cross) in a single pass.
         // Uses Sparse Short-Circuit evaluation to completely avoid allocating/writing to a full WxH bool matrix.
         let eroded_pixels: Vec<usize> = match threshold {
@@ -630,7 +630,7 @@ impl TetraExtractor {
 
         let mut extracted = Vec::new();
 
-        // 6. Label regions & 7. Accumulate statistics 
+        // 5. Label regions & 6. Accumulate statistics 
         // Helper: 4-Connected Components Labeling & Centered Moments executed in a single pass
         for &seed in &eroded_pixels {
             if !self.mask[seed] { continue; } 
@@ -713,13 +713,13 @@ impl TetraExtractor {
             });
         }
 
-        // 8. Sort
+        // 7. Sort
         extracted.sort_by(|a, b| b.sum.partial_cmp(&a.sum).unwrap_or(Ordering::Equal));
         if let Some(max_ret) = self.config.max_returned {
             extracted.truncate(max_ret);
         }
 
-        // 9. Centroid Window
+        // 8. Centroid Window
         if let Some(mut window) = self.config.centroid_window {
             window = window.min(height).min(width);
             for centroid in &mut extracted {
@@ -753,7 +753,7 @@ impl TetraExtractor {
             }
         }
 
-        // 10. Revert effects of crop and downsample
+        // 9. Revert effects of crop and downsample
         for centroid in &mut extracted {
             if let Some(ds) = self.config.downsample {
                 centroid.x *= ds as f64;
@@ -778,14 +778,4 @@ impl TetraExtractor {
             },
         }
     }
-}
-
-/// Convenience wrapper for stateless execution (Allocates buffers per call).
-/// For maximum performance, instantiate `TetraExtractor` and reuse it instead.
-pub fn get_centroids_from_image(
-    input_image: &Array2<f32>,
-    config: &CentroidConfig,
-) -> ExtractionResult {
-    let mut extractor = TetraExtractor::new(config.clone());
-    extractor.extract(input_image)
 }
