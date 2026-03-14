@@ -497,7 +497,6 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
- "rayon",
  "tokio",
  "tonic",
  "tonic-build",
