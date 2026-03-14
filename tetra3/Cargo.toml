@@ -18,5 +18,5 @@ tonic-build = "0.11"
 pyo3 = { version = "0.19", features = ["auto-initialize"] }
 numpy = "0.19"
 walkdir = "2.3"
-cedar_detect = { path = "../../cedar-detect" }
+cedar_detect = { git = "https://github.com/smroid/cedar-detect" }
 image = "0.25.1"

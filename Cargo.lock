@@ -485,6 +485,7 @@ dependencies = [
 [[package]]
 name = "cedar_detect"
 version = "0.8.0"
+source = "git+https://github.com/smroid/cedar-detect#da6be9d318976a1a0853ecdf6dd6cefe41615352"
 dependencies = [
  "approx",
  "clap",

@@ -1,24 +1,20 @@
 // Copyright (c) 2026 Omair Kamil oakamil@gmail.com
 // See LICENSE file in root directory for license terms.
 
+use image::GrayImage;
 use ndarray::Array2;
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
-use image::GrayImage;
 
-use tetra3::extractor::{CentroidConfig, TetraExtractor};
 use cedar_detect::algorithm::{estimate_noise_from_image, get_stars_from_image};
+use tetra3::extractor::{CentroidConfig, TetraExtractor};
 
-#[test]
-fn test_extraction_against_python() {
-    let mut total_rust_time = Duration::ZERO;
-    let mut total_py_time = Duration::ZERO;
-    let mut image_count = 0;
-
+/// Helper function to locate and return the test images, maximizing code reuse across tests.
+fn get_test_images() -> Vec<PathBuf> {
     // Assuming this test runs from the `tetra3` crate root, and `cedar-solve`
     // is cloned adjacent to the parent directory.
     let test_dir = "../../cedar-solve/examples/data/medium_fov";
@@ -41,6 +37,21 @@ fn test_extraction_against_python() {
         "No test images found in {}! Ensure cedar-solve is cloned in the correct relative location.",
         test_dir
     );
+
+    image_paths
+}
+
+/// Core validation logic that runs the Rust extractor against the Python extractor
+/// for a specific set of background and sigma modes.
+fn run_validation_suite(
+    bg_modes: &[(Option<tetra3::extractor::BgSubMode>, &str)],
+    sigma_modes: &[(tetra3::extractor::SigmaMode, &str)],
+) {
+    let mut total_rust_time = Duration::ZERO;
+    let mut total_py_time = Duration::ZERO;
+    let mut image_count = 0;
+
+    let image_paths = get_test_images();
 
     Python::with_gil(|py| {
         // Python helper to load the image into a float32 numpy array exactly as tetra3 does.
@@ -60,13 +71,37 @@ def load_image_as_array(path):
             image = image.squeeze(axis=2)
     return image
 
-def run_py_extraction(image_array):
+def run_py_extraction(image_array, bg_sub_mode, sigma_mode):
+    # Handle the "None" string gracefully for Python logic
+    if bg_sub_mode == "None":
+        bg_sub_mode = None
+
     # return_moments=True returns: (centroids, [sum, area, moments, axis_ratio])
-    centroids, moments = get_centroids_from_image(image_array, return_moments=True)
-    # Force float64 arrays to prevent PyO3 TypeError panics in Rust
+    result = get_centroids_from_image(
+        image_array, 
+        bg_sub_mode=bg_sub_mode, 
+        sigma_mode=sigma_mode, 
+        return_moments=True
+    )
+    
+    # tetra3.py returns a 5-tuple if 0 stars are found, but a 2-tuple containing a list if >0 stars are found.
+    # We must explicitly handle this empty case to prevent unpacking errors.
+    if len(result) == 5:
+        centroids = result[0]
+        moments = result[1:] 
+    else:
+        centroids, moments = result
+        
+    # Force float64 arrays AND strictly enforce dimensionality to prevent PyO3 TypeError panics.
+    # tetra3.py inconsistently returns shape (0, 1) [2D] for 0-star runs instead of (0,) [1D].
     return (
-        np.asarray(centroids, dtype=np.float64),
-        [np.asarray(m, dtype=np.float64) for m in moments]
+        np.asarray(centroids, dtype=np.float64).reshape(-1, 2),
+        [
+            np.asarray(moments[0], dtype=np.float64).flatten(),    # sum -> 1D
+            np.asarray(moments[1], dtype=np.float64).flatten(),    # area -> 1D
+            np.asarray(moments[2], dtype=np.float64).reshape(-1, 3), # moments -> 2D
+            np.asarray(moments[3], dtype=np.float64).flatten()     # axis_ratio -> 1D
+        ]
     )
 "#;
 
@@ -74,14 +109,9 @@ def run_py_extraction(image_array):
         let load_image_as_array = module.getattr("load_image_as_array").unwrap();
         let run_py_extraction = module.getattr("run_py_extraction").unwrap();
 
-        let mut extractor = tetra3::extractor::TetraExtractor::new(CentroidConfig {
-                return_images: false,
-                ..Default::default()
-            });
-
         for image_path in &image_paths {
             let img_name = image_path.file_name().unwrap();
-            println!("Testing image: {:?}", img_name);
+            println!("\nTesting image: {:?}", img_name);
 
             // 1. Load the image into Python and get the raw f32 numpy array.
             let py_image_array: &PyAny = load_image_as_array
@@ -89,121 +119,396 @@ def run_py_extraction(image_array):
                 .unwrap();
 
             // Extract the Array2<f32> for Rust.
-            // We do a manual copy into a Vec to bridge the gap between `numpy`'s ndarray v0.15 
+            // We do a manual copy into a Vec to bridge the gap between `numpy`'s ndarray v0.15
             // and the main crate's ndarray v0.17, avoiding version-conflict compile errors.
             let py_readonly_img: PyReadonlyArray2<f32> = py_image_array.extract().unwrap();
             let py_view = py_readonly_img.as_array();
             let nrows = py_view.shape()[0];
             let ncols = py_view.shape()[1];
-            
+
             let mut vec_data = Vec::with_capacity(nrows * ncols);
             for r in 0..nrows {
                 for c in 0..ncols {
                     vec_data.push(*py_view.get([r, c]).unwrap());
                 }
             }
-            let rust_input_img: Array2<f32> = Array2::from_shape_vec((nrows, ncols), vec_data).unwrap();
+            let rust_input_img: Array2<f32> =
+                Array2::from_shape_vec((nrows, ncols), vec_data).unwrap();
 
-            // 2. Run Python Algorithm
-            let start_py = Instant::now();
-            let py_result = run_py_extraction.call1((py_image_array,)).unwrap();
-            total_py_time += start_py.elapsed();
+            // Iterate through every combination of modes
+            for (bg_rs, bg_py) in bg_modes {
+                for (sig_rs, sig_py) in sigma_modes {
+                    let mut extractor = tetra3::extractor::TetraExtractor::new(CentroidConfig {
+                        bg_sub_mode: *bg_rs,
+                        sigma_mode: *sig_rs,
+                        return_images: false,
+                        ..Default::default()
+                    });
 
-            // 3. Run Rust Algorithm
-            let start_rust = Instant::now();
-            let rust_result = extractor.extract(&rust_input_img);
-            total_rust_time += start_rust.elapsed();
-
-            image_count += 1;
-
-            // 4. Parse Python Results using safe indexing methods
-            let py_tuple: &PyTuple = py_result.downcast().unwrap();
-            let py_centroids_arr: PyReadonlyArray2<f64> = py_tuple.get_item(0).unwrap().extract().unwrap();
-
-            let py_moments_list: &PyList = py_tuple.get_item(1).unwrap().downcast().unwrap();
-            let py_sum_arr: PyReadonlyArray1<f64> = py_moments_list.get_item(0).unwrap().extract().unwrap();
-            let py_area_arr: PyReadonlyArray1<f64> = py_moments_list.get_item(1).unwrap().extract().unwrap();
-            let py_m2_arr: PyReadonlyArray2<f64> = py_moments_list.get_item(2).unwrap().extract().unwrap();
-            let py_ratio_arr: PyReadonlyArray1<f64> = py_moments_list.get_item(3).unwrap().extract().unwrap();
-
-            let py_centroids_view = py_centroids_arr.as_array();
-            let py_sum = py_sum_arr.as_array();
-            let py_area = py_area_arr.as_array();
-            let py_m2_view = py_m2_arr.as_array();
-            let py_ratio = py_ratio_arr.as_array();
-
-            let rust_centroids = &rust_result.centroids;
-
-            // 5. Compare Results
-            assert_eq!(
-                rust_centroids.len(),
-                py_centroids_view.shape()[0],
-                "Mismatch in number of extracted centroids for image: {:?}",
-                img_name
-            );
-
-            let eps = 1e-3;
-
-            for i in 0..rust_centroids.len() {
-                let r_c = &rust_centroids[i];
-
-                let p_y = *py_centroids_view.get([i, 0]).unwrap();
-                let p_x = *py_centroids_view.get([i, 1]).unwrap();
-                let p_sum = *py_sum.get(i).unwrap();
-                let p_area = *py_area.get(i).unwrap() as usize;
-                
-                // m2_xx is at index 0, m2_yy is at index 1
-                let p_m2_xx = *py_m2_view.get([i, 0]).unwrap();
-                let p_m2_yy = *py_m2_view.get([i, 1]).unwrap();
-                let p_m2_xy = *py_m2_view.get([i, 2]).unwrap();
-                
-                let p_ratio = *py_ratio.get(i).unwrap();
-
-                assert!(
-                    (r_c.y - p_y).abs() < eps, 
-                    "[{:?}] Y mismatch at star {}: Rust {} vs Py {}", img_name, i, r_c.y, p_y
-                );
-                assert!(
-                    (r_c.x - p_x).abs() < eps, 
-                    "[{:?}] X mismatch at star {}: Rust {} vs Py {}", img_name, i, r_c.x, p_x
-                );
-                assert!(
-                    (r_c.sum - p_sum).abs() / p_sum.max(1.0) < 1e-4, 
-                    "[{:?}] Sum mismatch at star {} (y:{:.1}, x:{:.1}): Rust {} vs Py {}", 
-                    img_name, i, r_c.y, r_c.x, r_c.sum, p_sum
-                );
-                assert_eq!(
-                    r_c.area, p_area, 
-                    "[{:?}] Area mismatch at star {} (y:{:.1}, x:{:.1}): Rust {} vs Py {}", 
-                    img_name, i, r_c.y, r_c.x, r_c.area, p_area
-                );
-
-                // Higher order moments can be NaN in Python if area constraints fail
-                if !p_m2_xx.is_nan() && !r_c.m2_xx.is_nan() {
-                    assert!(
-                        (r_c.m2_xx - p_m2_xx).abs() < eps, 
-                        "[{:?}] m2_xx mismatch at star {} (y:{:.1}, x:{:.1}): Rust {} vs Py {}", 
-                        img_name, i, r_c.y, r_c.x, r_c.m2_xx, p_m2_xx
+                    // 2. Run Python Algorithm
+                    println!(
+                        "  -> Running Python extraction (bg: {}, sig: {})...",
+                        bg_py, sig_py
                     );
-                    assert!(
-                        (r_c.m2_yy - p_m2_yy).abs() < eps, 
-                        "[{:?}] m2_yy mismatch at star {} (y:{:.1}, x:{:.1}): Rust {} vs Py {}", 
-                        img_name, i, r_c.y, r_c.x, r_c.m2_yy, p_m2_yy
+                    let start_py = Instant::now();
+                    let py_result = run_py_extraction
+                        .call1((py_image_array, *bg_py, *sig_py))
+                        .unwrap();
+                    total_py_time += start_py.elapsed();
+
+                    // 3. Run Rust Algorithm
+                    println!(
+                        "  -> Running Rust extraction (bg: {}, sig: {})...",
+                        bg_py, sig_py
                     );
-                    assert!(
-                        (r_c.m2_xy - p_m2_xy).abs() < eps, 
-                        "[{:?}] m2_xy mismatch at star {} (y:{:.1}, x:{:.1}): Rust {} vs Py {}", 
-                        img_name, i, r_c.y, r_c.x, r_c.m2_xy, p_m2_xy
+                    let start_rust = Instant::now();
+                    let rust_result = extractor.extract(&rust_input_img);
+                    total_rust_time += start_rust.elapsed();
+
+                    image_count += 1;
+
+                    // 4. Parse Python Results using safe indexing methods
+                    let py_tuple: &PyTuple = py_result.downcast().unwrap();
+                    let py_centroids_arr: PyReadonlyArray2<f64> =
+                        py_tuple.get_item(0).unwrap().extract().unwrap();
+
+                    let py_moments_list: &PyList =
+                        py_tuple.get_item(1).unwrap().downcast().unwrap();
+                    let py_sum_arr: PyReadonlyArray1<f64> =
+                        py_moments_list.get_item(0).unwrap().extract().unwrap();
+                    let py_area_arr: PyReadonlyArray1<f64> =
+                        py_moments_list.get_item(1).unwrap().extract().unwrap();
+                    let py_m2_arr: PyReadonlyArray2<f64> =
+                        py_moments_list.get_item(2).unwrap().extract().unwrap();
+                    let py_ratio_arr: PyReadonlyArray1<f64> =
+                        py_moments_list.get_item(3).unwrap().extract().unwrap();
+
+                    let py_centroids_view = py_centroids_arr.as_array();
+                    let py_sum = py_sum_arr.as_array();
+                    let py_area = py_area_arr.as_array();
+                    let py_m2_view = py_m2_arr.as_array();
+                    let py_ratio = py_ratio_arr.as_array();
+
+                    // --- STABILIZE SORTING FOR TIES ---
+                    // Floating point math accumulation differs slightly between Rust and Python.
+                    // We must quantize the values so identical sums that differ by 0.0000001
+                    // are treated as perfect ties, allowing the logic to fall through to the Y and X coordinates.
+                    let q_sum = |v: f64| (v * 1000.0).round() as i64;
+                    let q_coord = |v: f64| (v * 10.0).round() as i64;
+
+                    let mut rust_centroids_sorted = rust_result.centroids.clone();
+                    rust_centroids_sorted.sort_by(|a, b| {
+                        q_sum(b.sum)
+                            .cmp(&q_sum(a.sum))
+                            .then_with(|| q_coord(a.y).cmp(&q_coord(b.y)))
+                            .then_with(|| q_coord(a.x).cmp(&q_coord(b.x)))
+                    });
+
+                    let mut py_indices: Vec<usize> = (0..py_centroids_view.shape()[0]).collect();
+                    py_indices.sort_by(|&i, &j| {
+                        let sum_i = py_sum.get(i).unwrap();
+                        let sum_j = py_sum.get(j).unwrap();
+                        let y_i = py_centroids_view.get([i, 0]).unwrap();
+                        let y_j = py_centroids_view.get([j, 0]).unwrap();
+                        let x_i = py_centroids_view.get([i, 1]).unwrap();
+                        let x_j = py_centroids_view.get([j, 1]).unwrap();
+
+                        q_sum(*sum_j)
+                            .cmp(&q_sum(*sum_i))
+                            .then_with(|| q_coord(*y_i).cmp(&q_coord(*y_j)))
+                            .then_with(|| q_coord(*x_i).cmp(&q_coord(*x_j)))
+                    });
+
+                    let eps = 1e-3;
+                    let mut mismatch_detected = false;
+
+                    // 5. Compare Results (Pre-check for logging block)
+                    if rust_centroids_sorted.len() != py_indices.len() {
+                        mismatch_detected = true;
+                    } else {
+                        // Check for data mismatch
+                        for i in 0..rust_centroids_sorted.len() {
+                            let r_c = &rust_centroids_sorted[i];
+                            let py_idx = py_indices[i];
+                            let p_y = *py_centroids_view.get([py_idx, 0]).unwrap();
+                            let p_x = *py_centroids_view.get([py_idx, 1]).unwrap();
+                            let p_sum = *py_sum.get(py_idx).unwrap();
+
+                            if (r_c.y - p_y).abs() >= eps
+                                || (r_c.x - p_x).abs() >= eps
+                                || (r_c.sum - p_sum).abs() / p_sum.max(1.0) >= 1e-4
+                            {
+                                mismatch_detected = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // --- LOGGING BLOCK ---
+                    if mismatch_detected {
+                        let total_len = rust_centroids_sorted.len().max(py_indices.len());
+
+                        // Find the exact index where the divergence starts
+                        let mut first_mismatch_idx = 0;
+                        for i in 0..total_len {
+                            let r_c_match = rust_centroids_sorted.get(i);
+                            let py_idx_match = py_indices.get(i);
+
+                            let mut row_mismatch = false;
+                            if let (Some(r), Some(&p_idx)) = (r_c_match, py_idx_match) {
+                                let p_y = *py_centroids_view.get([p_idx, 0]).unwrap();
+                                let p_x = *py_centroids_view.get([p_idx, 1]).unwrap();
+                                let p_sum = *py_sum.get(p_idx).unwrap();
+
+                                if (r.y - p_y).abs() >= eps
+                                    || (r.x - p_x).abs() >= eps
+                                    || (r.sum - p_sum).abs() / p_sum.max(1.0) >= 1e-4
+                                {
+                                    row_mismatch = true;
+                                }
+                            } else {
+                                row_mismatch = true; // One list is shorter than the other
+                            }
+
+                            if row_mismatch {
+                                first_mismatch_idx = i;
+                                break;
+                            }
+                        }
+
+                        println!("\n=======================================================");
+                        println!(
+                            "MISMATCH DETECTED: [{:?} | bg: {}, sig: {}]",
+                            img_name, bg_py, sig_py
+                        );
+                        println!(
+                            "Rust total: {}, Py total: {}",
+                            rust_centroids_sorted.len(),
+                            py_indices.len()
+                        );
+                        println!(
+                            "Showing window around first failure at index {}",
+                            first_mismatch_idx
+                        );
+                        println!(
+                            "{:<5} | {:<30} | {:<30}",
+                            "Index", "Rust (Y, X, Sum, Area)", "Python (Y, X, Sum, Area)"
+                        );
+                        println!("-------------------------------------------------------");
+
+                        // Print a window: 5 rows before the mismatch, 15 rows after
+                        let start_idx = first_mismatch_idx.saturating_sub(5);
+                        let end_idx = (first_mismatch_idx + 15).min(total_len);
+
+                        if start_idx > 0 {
+                            println!("...   | ...                            | ...");
+                        }
+
+                        for i in start_idx..end_idx {
+                            let r_str = if i < rust_centroids_sorted.len() {
+                                let c = &rust_centroids_sorted[i];
+                                format!("({:.1}, {:.1}, {:.1}, {})", c.y, c.x, c.sum, c.area)
+                            } else {
+                                "NONE".to_string()
+                            };
+
+                            let p_str = if i < py_indices.len() {
+                                let py_idx = py_indices[i];
+                                let p_y = *py_centroids_view.get([py_idx, 0]).unwrap();
+                                let p_x = *py_centroids_view.get([py_idx, 1]).unwrap();
+                                let p_sum = *py_sum.get(py_idx).unwrap();
+                                let p_area = *py_area.get(py_idx).unwrap() as usize;
+                                format!("({:.1}, {:.1}, {:.1}, {})", p_y, p_x, p_sum, p_area)
+                            } else {
+                                "NONE".to_string()
+                            };
+
+                            let marker = if r_str != p_str { " * " } else { "   " };
+                            println!("{:<5}{}| {:<30} | {:<30}", i, marker, r_str, p_str);
+                        }
+
+                        if end_idx < total_len {
+                            println!("...   | ...                            | ...");
+                        }
+                        println!("=======================================================\n");
+                    }
+
+                    // Proceed with standard assertions so the test still explicitly fails
+                    assert_eq!(
+                        rust_centroids_sorted.len(),
+                        py_indices.len(),
+                        "[{:?} | bg: {}, sig: {}] Length mismatch",
+                        img_name,
+                        bg_py,
+                        sig_py
                     );
-                    assert!(
-                        (r_c.axis_ratio - p_ratio).abs() < eps, 
-                        "[{:?}] Axis ratio mismatch at star {} (y:{:.1}, x:{:.1}): Rust {} vs Py {}", 
-                        img_name, i, r_c.y, r_c.x, r_c.axis_ratio, p_ratio
-                    );
+
+                    for i in 0..rust_centroids_sorted.len() {
+                        let r_c = &rust_centroids_sorted[i];
+                        let py_idx = py_indices[i];
+
+                        let p_y = *py_centroids_view.get([py_idx, 0]).unwrap();
+                        let p_x = *py_centroids_view.get([py_idx, 1]).unwrap();
+                        let p_sum = *py_sum.get(py_idx).unwrap();
+                        let p_area = *py_area.get(py_idx).unwrap() as usize;
+
+                        // m2_xx is at index 0, m2_yy is at index 1
+                        let p_m2_xx = *py_m2_view.get([py_idx, 0]).unwrap();
+                        let p_m2_yy = *py_m2_view.get([py_idx, 1]).unwrap();
+                        let p_m2_xy = *py_m2_view.get([py_idx, 2]).unwrap();
+
+                        let p_ratio = *py_ratio.get(py_idx).unwrap();
+
+                        assert!(
+                            (r_c.y - p_y).abs() < eps,
+                            "[{:?} | bg: {}, sig: {}] Y mismatch at sorted index {}: Rust {} vs Py {}",
+                            img_name,
+                            bg_py,
+                            sig_py,
+                            i,
+                            r_c.y,
+                            p_y
+                        );
+                        assert!(
+                            (r_c.x - p_x).abs() < eps,
+                            "[{:?} | bg: {}, sig: {}] X mismatch at sorted index {}: Rust {} vs Py {}",
+                            img_name,
+                            bg_py,
+                            sig_py,
+                            i,
+                            r_c.x,
+                            p_x
+                        );
+                        assert!(
+                            (r_c.sum - p_sum).abs() / p_sum.max(1.0) < 1e-4,
+                            "[{:?} | bg: {}, sig: {}] Sum mismatch at sorted index {} (y:{:.1}, x:{:.1}): Rust {} vs Py {}",
+                            img_name,
+                            bg_py,
+                            sig_py,
+                            i,
+                            r_c.y,
+                            r_c.x,
+                            r_c.sum,
+                            p_sum
+                        );
+                        assert_eq!(
+                            r_c.area, p_area,
+                            "[{:?} | bg: {}, sig: {}] Area mismatch at sorted index {} (y:{:.1}, x:{:.1}): Rust {} vs Py {}",
+                            img_name, bg_py, sig_py, i, r_c.y, r_c.x, r_c.area, p_area
+                        );
+
+                        // Higher order moments can be NaN in Python if area constraints fail
+                        if !p_m2_xx.is_nan() && !r_c.m2_xx.is_nan() {
+                            assert!(
+                                (r_c.m2_xx - p_m2_xx).abs() < eps,
+                                "[{:?} | bg: {}, sig: {}] m2_xx mismatch at sorted index {} (y:{:.1}, x:{:.1}): Rust {} vs Py {}",
+                                img_name,
+                                bg_py,
+                                sig_py,
+                                i,
+                                r_c.y,
+                                r_c.x,
+                                r_c.m2_xx,
+                                p_m2_xx
+                            );
+                            assert!(
+                                (r_c.m2_yy - p_m2_yy).abs() < eps,
+                                "[{:?} | bg: {}, sig: {}] m2_yy mismatch at sorted index {} (y:{:.1}, x:{:.1}): Rust {} vs Py {}",
+                                img_name,
+                                bg_py,
+                                sig_py,
+                                i,
+                                r_c.y,
+                                r_c.x,
+                                r_c.m2_yy,
+                                p_m2_yy
+                            );
+                            assert!(
+                                (r_c.m2_xy - p_m2_xy).abs() < eps,
+                                "[{:?} | bg: {}, sig: {}] m2_xy mismatch at sorted index {} (y:{:.1}, x:{:.1}): Rust {} vs Py {}",
+                                img_name,
+                                bg_py,
+                                sig_py,
+                                i,
+                                r_c.y,
+                                r_c.x,
+                                r_c.m2_xy,
+                                p_m2_xy
+                            );
+                            assert!(
+                                (r_c.axis_ratio - p_ratio).abs() < eps,
+                                "[{:?} | bg: {}, sig: {}] Axis ratio mismatch at sorted index {} (y:{:.1}, x:{:.1}): Rust {} vs Py {}",
+                                img_name,
+                                bg_py,
+                                sig_py,
+                                i,
+                                r_c.y,
+                                r_c.x,
+                                r_c.axis_ratio,
+                                p_ratio
+                            );
+                        }
+                    }
                 }
             }
         }
     });
+}
+
+#[test]
+fn test_extraction_against_python_sanity() {
+    // Tests only the default extraction modes to ensure the base path works.
+    let bg_modes = [(Some(tetra3::extractor::BgSubMode::LocalMean), "local_mean")];
+    let sigma_modes = [(
+        tetra3::extractor::SigmaMode::GlobalRootSquare,
+        "global_root_square",
+    )];
+
+    run_validation_suite(&bg_modes, &sigma_modes);
+}
+
+#[test]
+#[ignore]
+fn test_extraction_against_python_full() {
+    // Tests all permutations of background subtraction and sigma thresholding.
+    // This test takes > 15 minutes on a Raspberry Pi 5
+    let bg_modes = [
+        (
+            Some(tetra3::extractor::BgSubMode::LocalMedian),
+            "local_median",
+        ),
+        (Some(tetra3::extractor::BgSubMode::LocalMean), "local_mean"),
+        (
+            Some(tetra3::extractor::BgSubMode::GlobalMedian),
+            "global_median",
+        ),
+        (
+            Some(tetra3::extractor::BgSubMode::GlobalMean),
+            "global_mean",
+        ),
+        (None, "None"),
+    ];
+
+    let sigma_modes = [
+        (
+            tetra3::extractor::SigmaMode::LocalMedianAbs,
+            "local_median_abs",
+        ),
+        (
+            tetra3::extractor::SigmaMode::LocalRootSquare,
+            "local_root_square",
+        ),
+        (
+            tetra3::extractor::SigmaMode::GlobalMedianAbs,
+            "global_median_abs",
+        ),
+        (
+            tetra3::extractor::SigmaMode::GlobalRootSquare,
+            "global_root_square",
+        ),
+    ];
+
+    run_validation_suite(&bg_modes, &sigma_modes);
 }
 
 #[test]
@@ -212,29 +517,9 @@ fn test_performance() {
     let mut total_py_time = Duration::ZERO;
     let mut total_cedar_time = Duration::ZERO;
     let mut image_count = 0;
+    let iterations = 10;
 
-    // Assuming this test runs from the `tetra3` crate root, and `cedar-solve`
-    // is cloned adjacent to the parent directory.
-    let test_dir = "../../cedar-solve/examples/data/medium_fov";
-    let mut image_paths = Vec::new();
-
-    if Path::new(test_dir).exists() {
-        for entry in WalkDir::new(test_dir).into_iter().filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if let Some(ext) = path.extension() {
-                let ext_str = ext.to_string_lossy().to_lowercase();
-                if ext_str == "jpg" || ext_str == "jpeg" || ext_str == "tiff" {
-                    image_paths.push(path.to_path_buf());
-                }
-            }
-        }
-    }
-
-    assert!(
-        !image_paths.is_empty(),
-        "No test images found in {}! Ensure cedar-solve is cloned in the correct relative location.",
-        test_dir
-    );
+    let image_paths = get_test_images();
 
     // Initialize global buffer to prevent OS allocation overhead during benchmarking
     let mut tetra_extractor = TetraExtractor::new(CentroidConfig {
@@ -260,22 +545,19 @@ def load_image_as_array(path):
             image = image.squeeze(axis=2)
     return image
 
-def run_py_extraction(image_array):
-    # return_moments=True returns: (centroids, [sum, area, moments, axis_ratio])
-    centroids, moments = get_centroids_from_image(image_array, return_moments=True)
-    # Force float64 arrays to prevent PyO3 TypeError panics in Rust
-    return (
-        np.asarray(centroids, dtype=np.float64),
-        [np.asarray(m, dtype=np.float64) for m in moments]
-    )
+def run_py_extraction_perf(image_array):
+    # Execute the extraction but do not allocate wrapper arrays or return data over the PyO3 boundary.
+    # This ensures the timer strictly captures the algorithmic execution time.
+    get_centroids_from_image(image_array, return_moments=True)
 "#;
 
         let module = PyModule::from_code(py, py_code, "test_helper.py", "test_helper").unwrap();
         let load_image_as_array = module.getattr("load_image_as_array").unwrap();
-        let run_py_extraction = module.getattr("run_py_extraction").unwrap();
-
-        let iterations = 10;
-        println!("Running {} iterations for accurate benchmarking...", iterations);
+        let run_py_extraction_perf = module.getattr("run_py_extraction_perf").unwrap();
+        println!(
+            "Running {} iterations for accurate benchmarking...",
+            iterations
+        );
 
         for _i in 0..iterations {
             for image_path in &image_paths {
@@ -284,14 +566,14 @@ def run_py_extraction(image_array):
                     .call1((image_path.to_str().unwrap(),))
                     .unwrap();
 
-                // Extract the Array2<f32> for Rust. 
-                // FIX: Manually copy elements to avoid ndarray version mismatch between numpy crate and tetra3 crate
+                // Extract the Array2<f32> for Rust.
+                // Manually copy elements to avoid ndarray version mismatch between numpy crate and tetra3 crate
                 let py_readonly_img: PyReadonlyArray2<f32> = py_image_array.extract().unwrap();
                 let py_view = py_readonly_img.as_array();
-                let rust_input_img: Array2<f32> = Array2::from_shape_fn(
-                    (py_view.nrows(), py_view.ncols()), 
-                    |(y, x)| py_view[[y, x]]
-                );
+                let rust_input_img: Array2<f32> =
+                    Array2::from_shape_fn((py_view.nrows(), py_view.ncols()), |(y, x)| {
+                        py_view[[y, x]]
+                    });
 
                 // Build image::GrayImage for cedar-detect
                 let (height, width) = (rust_input_img.nrows(), rust_input_img.ncols());
@@ -306,7 +588,7 @@ def run_py_extraction(image_array):
 
                 // 2. Run Python Algorithm
                 let start_py = Instant::now();
-                let _py_result = run_py_extraction.call1((py_image_array,)).unwrap();
+                let _py_result = run_py_extraction_perf.call1((py_image_array,)).unwrap();
                 total_py_time += start_py.elapsed();
 
                 // 3. Run Rust Algorithm (Tetra3 Port)
@@ -318,9 +600,8 @@ def run_py_extraction(image_array):
                 let start_cedar = Instant::now();
                 let noise_estimate = estimate_noise_from_image(&cedar_img);
                 // Execute CedarDetect without binning (binning = 1)
-                let _cedar_result = get_stars_from_image(
-                    &cedar_img, noise_estimate, 8.0, false, 1, true, false
-                );
+                let _cedar_result =
+                    get_stars_from_image(&cedar_img, noise_estimate, 8.0, false, 1, true, false);
                 total_cedar_time += start_cedar.elapsed();
 
                 image_count += 1;
@@ -330,21 +611,35 @@ def run_py_extraction(image_array):
 
     println!("\n==============================================");
     println!("CENTROID EXTRACTION PERFORMANCE REPORT");
-    println!("Images tested: {} ({} unique x 10 iterations)", image_count, image_paths.len());
+    println!(
+        "Images tested: {} ({} unique x {} iterations)",
+        image_count,
+        image_paths.len(),
+        iterations
+    );
     println!("----------------------------------------------");
     println!("Python (tetra3) Total Time : {:.2?}", total_py_time);
     if image_count > 0 {
-        println!("Python (tetra3) Avg/Image  : {:.2?}", total_py_time / image_count as u32);
+        println!(
+            "Python (tetra3) Avg/Image  : {:.2?}",
+            total_py_time / image_count as u32
+        );
     }
     println!("----------------------------------------------");
     println!("Rust (Port) Total Time     : {:.2?}", total_rust_time);
     if image_count > 0 {
-        println!("Rust (Port) Avg/Image      : {:.2?}", total_rust_time / image_count as u32);
+        println!(
+            "Rust (Port) Avg/Image      : {:.2?}",
+            total_rust_time / image_count as u32
+        );
     }
     println!("----------------------------------------------");
     println!("Rust (CedarDetect) Total   : {:.2?}", total_cedar_time);
     if image_count > 0 {
-        println!("Rust (CedarDetect) Avg     : {:.2?}", total_cedar_time / image_count as u32);
+        println!(
+            "Rust (CedarDetect) Avg     : {:.2?}",
+            total_cedar_time / image_count as u32
+        );
     }
     println!("----------------------------------------------");
 
