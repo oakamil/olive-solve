@@ -1,0 +1,195 @@
+syntax = "proto3";
+
+package tetra3;
+
+// --- Enums ---
+
+enum SolveStatus {
+    MATCH_FOUND = 0;
+    NO_MATCH = 1;
+    TIMEOUT = 2;
+    CANCELLED = 3;
+    TOO_FEW = 4;
+}
+
+enum BgSubMode {
+    BG_LOCAL_MEDIAN = 0;
+    BG_LOCAL_MEAN = 1;
+    BG_GLOBAL_MEDIAN = 2;
+    BG_GLOBAL_MEAN = 3;
+}
+
+enum SigmaMode {
+    SIGMA_LOCAL_MEDIAN_ABS = 0;
+    SIGMA_LOCAL_ROOT_SQUARE = 1;
+    SIGMA_GLOBAL_MEDIAN_ABS = 2;
+    SIGMA_GLOBAL_ROOT_SQUARE = 3;
+}
+
+// --- Common Data Structures ---
+
+message Pixel {
+    double y = 1;
+    double x = 2;
+}
+
+message SkyCoord {
+    double ra = 1;
+    double dec = 2;
+}
+
+message ImageInput {
+    // Shmem-friendly: pass the OS-specific shared memory ID
+    string shmem_name = 1;
+    uint32 width = 2;
+    uint32 height = 3;
+}
+
+message CentroidResult {
+    double y = 1;
+    double x = 2;
+    double sum = 3;
+    uint64 area = 4;
+    double m2_xx = 5;
+    double m2_yy = 6;
+    double m2_xy = 7;
+    double axis_ratio = 8;
+}
+
+// --- Requests & Configurations ---
+
+message Crop {
+    oneof crop_type {
+        uint64 fraction = 1;
+        CropCenter center = 2;
+        CropRegion region = 3;
+    }
+}
+
+message CropCenter {
+    uint64 height = 1;
+    uint64 width = 2;
+}
+
+message CropRegion {
+    uint64 height = 1;
+    uint64 width = 2;
+    int64 offset_y = 3;
+    int64 offset_x = 4;
+}
+
+message CentroidConfig {
+    optional float sigma = 1;
+    optional float image_th = 2;
+    Crop crop = 3;
+    optional uint64 downsample = 4;
+    optional uint64 filtsize = 5;
+    optional BgSubMode bg_sub_mode = 6;
+    optional SigmaMode sigma_mode = 7;
+    optional bool binary_open = 8;
+    optional uint64 centroid_window = 9;
+    optional uint64 max_area = 10;
+    optional uint64 min_area = 11;
+    optional double max_sum = 12;
+    optional double min_sum = 13;
+    optional double max_axis_ratio = 14;
+    optional uint64 max_returned = 15;
+    optional bool return_images = 16;
+}
+
+message SolveOptions {
+    optional double fov_estimate = 1;
+    optional double fov_max_error = 2;
+    optional double match_radius = 3;
+    optional double match_threshold = 4;
+    optional double solve_timeout_ms = 5;
+    optional double distortion = 6;
+    optional double match_max_error = 7;
+    optional bool return_matches = 8;
+    optional bool return_catalog = 9;
+    optional bool return_rotation_matrix = 10;
+    repeated Pixel target_pixel = 11;
+    repeated SkyCoord target_sky_coord = 12;
+}
+
+// --- Responses ---
+
+message ExtractionResult {
+    repeated CentroidResult centroids = 1;
+    // Note: Debug images omitted from gRPC to avoid massive payloads, 
+    // but can be added back as bytes if strictly necessary.
+    double extraction_time_ms = 2; 
+}
+
+message MatchedStar {
+    double ra = 1;
+    double dec = 2;
+    double mag = 3;
+}
+
+message CatalogIds {
+    repeated uint32 ids = 1;
+}
+
+message CatalogStarInfo {
+    double ra = 1;
+    double dec = 2;
+    double mag = 3;
+    double y = 4;
+    double x = 5;
+}
+
+message Solution {
+    optional double ra = 1;
+    optional double dec = 2;
+    optional double roll = 3;
+    optional double fov = 4;
+    optional double distortion = 5;
+    optional double rmse = 6;
+    optional double p90e = 7;
+    optional double maxe = 8;
+    optional uint64 matches = 9;
+    optional double prob = 10;
+    optional double epoch_equinox = 11;
+    optional double epoch_proper_motion = 12;
+    SolveStatus status = 13;
+    double t_solve_ms = 14;
+    repeated double rotation_matrix = 15; // Flattened 3x3 array (9 elements)
+    repeated double target_ra = 16;
+    repeated double target_dec = 17;
+    repeated double target_y = 18;
+    repeated double target_x = 19;
+    repeated Pixel matched_centroids = 20;
+    repeated MatchedStar matched_stars = 21;
+    repeated CatalogIds matched_cat_id = 22;
+    repeated CatalogStarInfo catalog_stars = 23;
+    
+    // Added extraction time for combined calls
+    optional double extraction_time_ms = 24; 
+}
+
+// --- RPC Endpoints ---
+
+message SolveRequest {
+    repeated Pixel centroids = 1;
+    uint32 image_width = 2;
+    uint32 image_height = 3;
+    SolveOptions options = 4;
+}
+
+message ExtractRequest {
+    ImageInput image = 1;
+    CentroidConfig config = 2;
+}
+
+message SolveFromImageRequest {
+    ImageInput image = 1;
+    CentroidConfig extract_config = 2;
+    SolveOptions solve_options = 3;
+}
+
+service Tetra3Service {
+    rpc Solve (SolveRequest) returns (Solution);
+    rpc Extract (ExtractRequest) returns (ExtractionResult);
+    rpc SolveFromImage (SolveFromImageRequest) returns (Solution);
+}

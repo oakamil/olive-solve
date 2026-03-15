@@ -1,0 +1,22 @@
+[package]
+name = "tetra3-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tetra3 = { path = "../tetra3" }
+tonic = "0.11"
+prost = "0.12"
+tokio = { version = "1.36", features = ["macros", "rt-multi-thread"] }
+clap = { version = "4.5", features = ["derive"] }
+ndarray = "0.17"
+rayon = "1.11.0"
+shared_memory = "0.12.4"
+
+[build-dependencies]
+tonic-build = "0.11"
+
+[dev-dependencies]
+image = "0.25.10"
+tokio = { version = "1.36", features = ["macros", "rt-multi-thread", "time"] }
+uuid = { version = "1.8", features = ["v4"] }
