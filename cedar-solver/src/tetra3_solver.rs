@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Omair Kamil oakamil@gmail.com
+// Required Notice: Copyright (c) 2026 Omair Kamil <oakamil@gmail.com>
 // See LICENSE file in root directory for license terms.
 
 use std::{
@@ -21,18 +21,18 @@ use cedar_elements::{
 };
 use ndarray::Array2;
 
-use tetra3::{SolveOptions, SolveStatus, Tetra3};
+use tetra3::{SolveOptions, SolveStatus, Solver};
 
 pub struct Tetra3Solver {
-    inner: tokio::sync::Mutex<Tetra3>,
+    inner: tokio::sync::Mutex<Solver>,
     // Shared cancellation flag between the trait and the solver loop
     cancelled: Arc<AtomicBool>,
 }
 
 impl Tetra3Solver {
-    pub fn new(tetra3: Tetra3) -> Self {
+    pub fn new(solver: Solver) -> Self {
         Tetra3Solver {
-            inner: tokio::sync::Mutex::new(tetra3),
+            inner: tokio::sync::Mutex::new(solver),
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -57,7 +57,7 @@ impl SolverTrait for Tetra3Solver {
         params: &SolveParams,
         _imu_estimate: Option<EquatorialCoordinates>,
     ) -> Result<PlateSolution, CanonicalError> {
-        let mut tetra3 = self.inner.lock().await;
+        let mut solver = self.inner.lock().await;
 
         // Convert slice of struct coordinates into the required ndarray Matrix
         // Tetra3 primarily maps image vectors as N x 2 (y, x).
@@ -108,7 +108,7 @@ impl SolverTrait for Tetra3Solver {
 
         // Pass the properly mapped array into the solver
         let result =
-            tetra3.solve_from_centroids(&centroids_array, (height as f64, width as f64), options);
+            solver.solve_from_centroids(&centroids_array, (height as f64, width as f64), options);
 
         match result.status {
             SolveStatus::MatchFound => {
@@ -152,7 +152,7 @@ mod tests {
     use zip::ZipArchive;
 
     use super::*;
-    use tetra3::Tetra3;
+    use tetra3::Solver;
     use tetra3_server::tetra3_server::{
         SolveRequest, SolveResult, SolveStatus as ProtoSolveStatus,
     };
@@ -167,7 +167,7 @@ mod tests {
             return;
         }
         let solver = Tetra3Solver::new(
-            Tetra3::load_database(db_path).expect("Failed to load Tetra3 database"),
+            Solver::load_database(db_path).expect("Failed to load Tetra3 database"),
         );
 
         let zip_path = Path::new("data/testdata.zip");

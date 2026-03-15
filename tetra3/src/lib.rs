@@ -2,5 +2,6 @@
 // See LICENSE file in root directory for license terms.
 
 pub mod extractor;
-pub mod tetra3;
-pub use crate::tetra3::*;
+pub mod solver;
+pub use crate::extractor::*;
+pub use crate::solver::*;

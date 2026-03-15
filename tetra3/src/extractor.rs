@@ -1,16 +1,16 @@
 // Required Notice: Copyright (c) 2026 Omair Kamil <oakamil@gmail.com>
-// 
+//
 // This file is a derivative work - a port to Rust with heavy performance
-// optimizations from `tetra3.py` of the cedar-solve and esa/tetra3 projects. 
+// optimizations from `tetra3.py` of the cedar-solve and esa/tetra3 projects.
 // The original underlying code is licensed under the Apache License, Version 2.0.
 // Original Copyright (c) European Space Agency, Steven Rosenthal, and contributors.
 //
 // This derivative work is licensed under the PolyForm Noncommercial License 1.0.0.
 // You may not use this file except in compliance with the PolyForm Noncommercial
-// License 1.0.0. A copy of the License is located in the LICENSE.md file in the 
+// License 1.0.0. A copy of the License is located in the LICENSE.md file in the
 // root of this repository.
 //
-// Commercial use of this software is strictly prohibited without a separate 
+// Commercial use of this software is strictly prohibited without a separate
 // commercial license.
 //
 //
@@ -346,9 +346,9 @@ fn fast_median_filter_2d(src: &[f32], out: &mut [f32], w: usize, h: usize, size:
         });
 }
 
-/// TetraExtractor maintains pre-allocated global buffers to eliminate OS memory allocations
+/// Extractor maintains pre-allocated global buffers to eliminate OS memory allocations
 /// during continuous execution, fulfilling the zero-allocation performance pattern.
-pub struct TetraExtractor {
+pub struct Extractor {
     pub config: CentroidConfig,
     image_vec: Vec<f32>,
     scratch: Vec<f32>,
@@ -358,7 +358,7 @@ pub struct TetraExtractor {
     stack: Vec<usize>, // Tiny stack size keeps the L1 cache hot on Pi 5 (bandwidth constrained)
 }
 
-impl TetraExtractor {
+impl Extractor {
     pub fn new(config: CentroidConfig) -> Self {
         Self {
             config,

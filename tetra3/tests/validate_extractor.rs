@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 use cedar_detect::algorithm::{estimate_noise_from_image, get_stars_from_image};
-use tetra3::extractor::{CentroidConfig, TetraExtractor};
+use tetra3::{CentroidConfig, Extractor};
 
 const PY_HELPER_CODE: &str = r#"
 from PIL import Image
@@ -164,14 +164,13 @@ fn run_validation_suite(
                 // Iterate through every combination of modes
                 for (bg_rs, bg_py) in bg_modes {
                     for (sig_rs, sig_py) in sigma_modes {
-                        let mut extractor =
-                            tetra3::extractor::TetraExtractor::new(CentroidConfig {
-                                bg_sub_mode: *bg_rs,
-                                sigma_mode: *sig_rs,
-                                downsample: ds_opt,
-                                return_images: false,
-                                ..Default::default()
-                            });
+                        let mut extractor = Extractor::new(CentroidConfig {
+                            bg_sub_mode: *bg_rs,
+                            sigma_mode: *sig_rs,
+                            downsample: ds_opt,
+                            return_images: false,
+                            ..Default::default()
+                        });
 
                         // 2. Run Python Algorithm
                         println!(
@@ -578,7 +577,7 @@ fn test_performance_vs_python() {
     let py_ds_arg = ds_opt.unwrap_or(0);
 
     // Initialize global buffer to prevent OS allocation overhead during benchmarking
-    let mut tetra_extractor = TetraExtractor::new(CentroidConfig {
+    let mut tetra_extractor = Extractor::new(CentroidConfig {
         downsample: ds_opt,
         return_images: false,
         ..Default::default()
@@ -673,7 +672,7 @@ fn test_performance_vs_cedar() {
         let ds_val = ds_opt.unwrap_or(1);
         let cedar_ds = ds_opt.unwrap_or(1) as u32;
 
-        let mut tetra_extractor = TetraExtractor::new(CentroidConfig {
+        let mut tetra_extractor = Extractor::new(CentroidConfig {
             downsample: ds_opt,
             return_images: false,
             ..Default::default()

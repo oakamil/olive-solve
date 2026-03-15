@@ -1,18 +1,18 @@
 // Required Notice: Copyright (c) 2026 Omair Kamil <oakamil@gmail.com>
-// 
+//
 // This file is a derivative work - a port to Rust with heavy performance
-// optimizations from `tetra3.py` of the cedar-solve and esa/tetra3 projects. 
+// optimizations from `tetra3.py` of the cedar-solve and esa/tetra3 projects.
 // The original underlying code is licensed under the Apache License, Version 2.0.
 // Original Copyright (c) European Space Agency, Steven Rosenthal, and contributors.
 //
 // This derivative work is licensed under the PolyForm Noncommercial License 1.0.0.
 // You may not use this file except in compliance with the PolyForm Noncommercial
-// License 1.0.0. A copy of the License is located in the LICENSE.md file in the 
+// License 1.0.0. A copy of the License is located in the LICENSE.md file in the
 // root of this repository.
 //
-// Commercial use of this software is strictly prohibited without a separate 
+// Commercial use of this software is strictly prohibited without a separate
 // commercial license.
-// 
+//
 //
 // Cedar Solve license:
 //    Copyright 2023 Steven Rosenthal smr@dt3.org
@@ -916,7 +916,7 @@ impl Scratchpads {
 
 // --- Main Engine ---
 
-pub struct Tetra3 {
+pub struct Solver {
     // OPTIMIZATION: Highly optimized cache-aligned struct lists
     pub star_table_flat: Vec<CatalogStar>,
     pub pattern_catalog_flat: Vec<usize>,
@@ -932,7 +932,7 @@ pub struct Tetra3 {
     cancelled: AtomicBool,
 }
 
-impl Tetra3 {
+impl Solver {
     pub fn load_database(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let file = File::open(path)?;
         let mut archive = ZipArchive::new(file)?;
@@ -1120,7 +1120,7 @@ impl Tetra3 {
 
         let p_size = *db_props.get("pattern_size").unwrap_or(&4.0) as usize;
 
-        Ok(Tetra3 {
+        Ok(Solver {
             star_table_flat,
             pattern_catalog_flat,
             star_kd_tree,
