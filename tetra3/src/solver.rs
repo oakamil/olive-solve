@@ -151,7 +151,7 @@ pub struct Solution {
     pub target_x: Option<Vec<Option<f64>>>,
     pub matched_centroids: Option<Vec<[f64; 2]>>,
     pub matched_stars: Option<Vec<[f64; 3]>>, // ra, dec, mag
-    pub matched_cat_id: Option<Vec<u32>>,
+    pub matched_cat_id: Option<Vec<Vec<u32>>>,
     pub catalog_stars: Option<Vec<(f64, f64, f64, f64, f64)>>, // ra, dec, mag, y, x
 }
 
@@ -462,7 +462,7 @@ fn verify_and_build_solution(
     scratch: &mut Scratchpads,
     star_kd_tree: &KdTree<f64, 3>,
     star_table_flat: &[CatalogStar],
-    star_catalog_ids: &Option<Array1<u32>>,
+    star_catalog_ids: &Option<Array2<u32>>,
     db_props: &HashMap<String, f64>,
     num_patterns: usize,
     rotation_matrix: &Matrix3<f64>,
@@ -784,8 +784,14 @@ fn verify_and_build_solution(
             let star_idx = scratch.sp_valid_cat_inds[cat_idx];
             let star = &star_table_flat[star_idx];
             m_stars.push([star.ra.to_degrees(), star.dec.to_degrees(), star.mag]);
+
+            // Extract the catalog ID as a Vec (1 element for hip_main/bsc5, 3 elements for tyc_main)
             if let Some(ids) = star_catalog_ids {
-                m_ids.push(ids[star_idx]);
+                let mut row_ids = Vec::with_capacity(ids.ncols());
+                for c in 0..ids.ncols() {
+                    row_ids.push(ids[[star_idx, c]]);
+                }
+                m_ids.push(row_ids);
             }
         }
         solution.matched_centroids = Some(m_cents);
@@ -924,7 +930,7 @@ pub struct Solver {
 
     pub pattern_largest_edge: Option<Array1<f32>>,
     pub pattern_key_hashes: Option<Array1<u16>>,
-    pub star_catalog_ids: Option<Array1<u32>>,
+    pub star_catalog_ids: Option<Array2<u32>>,
     pub db_props: HashMap<String, f64>,
     pub num_patterns: usize,
     pub linear_probe: bool,
@@ -943,9 +949,14 @@ impl Solver {
             let mut zf = arc.by_name(name)?;
             let mut buf = Vec::new();
             zf.read_to_end(&mut buf)?;
+
             let mut cursor = Cursor::new(&buf);
             let npy = NpyFile::new(&mut cursor)?;
             let shape = npy.shape().to_vec();
+            if shape.len() != 2 {
+                return Err("star_table must be 2D".into());
+            }
+
             let mut cursor = Cursor::new(&buf);
             let npy2 = NpyFile::new(&mut cursor)?;
             if let Ok(data) = npy2.into_vec::<f64>() {
@@ -954,6 +965,7 @@ impl Solver {
                     data,
                 )?);
             }
+
             let mut cursor = Cursor::new(&buf);
             let npy3 = NpyFile::new(&mut cursor)?;
             let data_f32: Vec<f32> = npy3.into_vec()?;
@@ -964,27 +976,49 @@ impl Solver {
             )?)
         };
 
+        // tetra3.py optimizes the data type of the pattern_catalog based on the number of patterns.
         let read_pattern_catalog = |arc: &mut ZipArchive<File>,
                                     name: &str|
          -> Result<Array2<usize>, Box<dyn std::error::Error>> {
             let mut zf = arc.by_name(name)?;
             let mut buf = Vec::new();
             zf.read_to_end(&mut buf)?;
+
             let mut cursor = Cursor::new(&buf);
             let npy = NpyFile::new(&mut cursor)?;
             let shape = npy.shape().to_vec();
-            let mut cursor = Cursor::new(&buf);
-            let npy2 = NpyFile::new(&mut cursor)?;
-            if let Ok(data_u16) = npy2.into_vec::<u16>() {
-                let data: Vec<usize> = data_u16.into_iter().map(|v| v as usize).collect();
-                return Ok(Array2::from_shape_vec(
-                    (shape[0] as usize, shape[1] as usize),
-                    data,
-                )?);
+            if shape.len() != 2 {
+                return Err("pattern_catalog must be 2D".into());
             }
+
+            // Fallback 1: Try u8 (tetra3 uses this for very small catalogs)
             let mut cursor = Cursor::new(&buf);
-            let npy3 = NpyFile::new(&mut cursor)?;
-            let data_u32: Vec<u32> = npy3.into_vec()?;
+            if let Ok(npy) = NpyFile::new(&mut cursor) {
+                if let Ok(data_u8) = npy.into_vec::<u8>() {
+                    let data: Vec<usize> = data_u8.into_iter().map(|v| v as usize).collect();
+                    return Ok(Array2::from_shape_vec(
+                        (shape[0] as usize, shape[1] as usize),
+                        data,
+                    )?);
+                }
+            }
+
+            // Fallback 2: Try u16
+            let mut cursor = Cursor::new(&buf);
+            if let Ok(npy) = NpyFile::new(&mut cursor) {
+                if let Ok(data_u16) = npy.into_vec::<u16>() {
+                    let data: Vec<usize> = data_u16.into_iter().map(|v| v as usize).collect();
+                    return Ok(Array2::from_shape_vec(
+                        (shape[0] as usize, shape[1] as usize),
+                        data,
+                    )?);
+                }
+            }
+
+            // Fallback 3: Try u32
+            let mut cursor = Cursor::new(&buf);
+            let npy = NpyFile::new(&mut cursor)?;
+            let data_u32: Vec<u32> = npy.into_vec()?;
             let data: Vec<usize> = data_u32.into_iter().map(|v| v as usize).collect();
             Ok(Array2::from_shape_vec(
                 (shape[0] as usize, shape[1] as usize),
@@ -1012,21 +1046,61 @@ impl Solver {
             })
         };
 
-        let read_1d_u32 = |arc: &mut ZipArchive<File>, name: &str| -> Option<Array1<u32>> {
-            arc.by_name(name).ok().and_then(|mut zf| {
-                let mut buf = Vec::new();
-                zf.read_to_end(&mut buf).ok()?;
-                let mut cursor = Cursor::new(&buf);
-                let npy = NpyFile::new(&mut cursor).ok()?;
-                Some(Array1::from_vec(npy.into_vec().ok()?))
-            })
-        };
+        let read_star_catalog_ids =
+            |arc: &mut ZipArchive<File>, name: &str| -> Option<Array2<u32>> {
+                arc.by_name(name).ok().and_then(|mut zf| {
+                    let mut buf = Vec::new();
+                    zf.read_to_end(&mut buf).ok()?;
+
+                    // Try 1D u32 (hip_main)
+                    let try_1d_u32 = || -> Option<Array2<u32>> {
+                        let mut cursor = Cursor::new(&buf);
+                        let npy = NpyFile::new(&mut cursor).ok()?;
+                        if npy.shape().len() != 1 {
+                            return None;
+                        }
+                        let data = npy.into_vec::<u32>().ok()?;
+                        Array2::from_shape_vec((data.len(), 1), data).ok()
+                    };
+
+                    // Try 1D u16 (bsc5)
+                    let try_1d_u16 = || -> Option<Array2<u32>> {
+                        let mut cursor = Cursor::new(&buf);
+                        let npy = NpyFile::new(&mut cursor).ok()?;
+                        if npy.shape().len() != 1 {
+                            return None;
+                        }
+                        let data = npy.into_vec::<u16>().ok()?;
+                        let data_u32: Vec<u32> = data.into_iter().map(|v| v as u32).collect();
+                        Array2::from_shape_vec((data_u32.len(), 1), data_u32).ok()
+                    };
+
+                    // Try 2D u16 (tyc_main)
+                    let try_2d_u16 = || -> Option<Array2<u32>> {
+                        let mut cursor = Cursor::new(&buf);
+                        let npy = NpyFile::new(&mut cursor).ok()?;
+                        let shape = npy.shape();
+                        if shape.len() != 2 || shape[1] != 3 {
+                            return None;
+                        }
+
+                        let rows = shape[0] as usize;
+                        let cols = shape[1] as usize;
+                        let data = npy.into_vec::<u16>().ok()?;
+                        let data_u32: Vec<u32> = data.into_iter().map(|v| v as u32).collect();
+                        Array2::from_shape_vec((rows, cols), data_u32).ok()
+                    };
+
+                    // Chain the attempts
+                    try_1d_u32().or_else(try_1d_u16).or_else(try_2d_u16)
+                })
+            };
 
         let pattern_catalog_arr = read_pattern_catalog(&mut archive, "pattern_catalog.npy")?;
         let star_table_arr = read_star_table(&mut archive, "star_table.npy")?;
         let pattern_largest_edge = read_1d_f32(&mut archive, "pattern_largest_edge.npy");
         let pattern_key_hashes = read_1d_u16(&mut archive, "pattern_key_hashes.npy");
-        let star_catalog_ids = read_1d_u32(&mut archive, "star_catalog_IDs.npy");
+        let star_catalog_ids = read_star_catalog_ids(&mut archive, "star_catalog_IDs.npy");
 
         // OPTIMIZATION: Convert massive Array2 allocations to deeply mapped fast internal native slices
         let mut star_table_flat = Vec::with_capacity(star_table_arr.nrows());
@@ -1070,49 +1144,86 @@ impl Solver {
             let mut buf = Vec::new();
             if zf.read_to_end(&mut buf).is_ok() {
                 let mut cursor = Cursor::new(&buf);
+                // NpyFile::new parses and skips the header, advancing the cursor to the payload
                 if NpyFile::new(&mut cursor).is_ok() {
-                    let mut data = vec![0u8; 828];
-                    if cursor.read_exact(&mut data).is_ok() {
-                        let mut hash_type = String::new();
-                        for i in 0..64 {
-                            let offset = 256 + (i * 4);
-                            let c = data[offset];
-                            if c == 0 {
-                                break;
-                            }
-                            hash_type.push(c as char);
-                        }
-                        if hash_type.trim() == "linear_probe" {
-                            linear_probe = true;
-                        }
+                    let mut data = Vec::new();
+                    // Read the remaining payload bytes directly from the cursor
+                    if cursor.read_to_end(&mut data).is_ok() {
+                        let len = data.len();
 
-                        let p_size = u16::from_le_bytes([data[512], data[513]]);
-                        db_props.insert("pattern_size".to_string(), p_size as f64);
-                        let p_bins = u16::from_le_bytes([data[514], data[515]]);
-                        db_props.insert("pattern_bins".to_string(), p_bins as f64);
-                        let p_max_err =
-                            f32::from_le_bytes([data[516], data[517], data[518], data[519]]);
-                        db_props.insert("pattern_max_error".to_string(), p_max_err as f64);
-                        let max_fov =
-                            f32::from_le_bytes([data[520], data[521], data[522], data[523]]);
-                        db_props.insert("max_fov".to_string(), max_fov as f64);
-                        let min_fov =
-                            f32::from_le_bytes([data[524], data[525], data[526], data[527]]);
-                        db_props.insert("min_fov".to_string(), min_fov as f64);
-                        let eq = u16::from_le_bytes([data[784], data[785]]);
-                        db_props.insert("epoch_equinox".to_string(), eq as f64);
-                        let pm = f32::from_le_bytes([data[786], data[787], data[788], data[789]]);
-                        db_props.insert("epoch_proper_motion".to_string(), pm as f64);
-                        let vs = u16::from_le_bytes([data[800], data[801]]);
-                        db_props.insert("verification_stars_per_fov".to_string(), vs as f64);
-                        let presort = data[823] != 0;
-                        db_props.insert(
-                            "presort_patterns".to_string(),
-                            if presort { 1.0 } else { 0.0 },
-                        );
-                        num_patterns =
-                            u32::from_le_bytes([data[824], data[825], data[826], data[827]])
-                                as usize;
+                        // 828 bytes = cedar-solve schema
+                        if len >= 828 {
+                            let mut hash_type = String::new();
+                            for i in 0..64 {
+                                let offset = 256 + (i * 4);
+                                let c = data[offset];
+                                if c == 0 {
+                                    break;
+                                }
+                                hash_type.push(c as char);
+                            }
+                            if hash_type.trim() == "linear_probe" {
+                                linear_probe = true;
+                            }
+
+                            let p_size = u16::from_le_bytes([data[512], data[513]]);
+                            db_props.insert("pattern_size".to_string(), p_size as f64);
+                            let p_bins = u16::from_le_bytes([data[514], data[515]]);
+                            db_props.insert("pattern_bins".to_string(), p_bins as f64);
+                            let p_max_err =
+                                f32::from_le_bytes([data[516], data[517], data[518], data[519]]);
+                            db_props.insert("pattern_max_error".to_string(), p_max_err as f64);
+                            let max_fov =
+                                f32::from_le_bytes([data[520], data[521], data[522], data[523]]);
+                            db_props.insert("max_fov".to_string(), max_fov as f64);
+                            let min_fov =
+                                f32::from_le_bytes([data[524], data[525], data[526], data[527]]);
+                            db_props.insert("min_fov".to_string(), min_fov as f64);
+                            let eq = u16::from_le_bytes([data[784], data[785]]);
+                            db_props.insert("epoch_equinox".to_string(), eq as f64);
+                            let pm =
+                                f32::from_le_bytes([data[786], data[787], data[788], data[789]]);
+                            db_props.insert("epoch_proper_motion".to_string(), pm as f64);
+                            let vs = u16::from_le_bytes([data[800], data[801]]);
+                            db_props.insert("verification_stars_per_fov".to_string(), vs as f64);
+                            let presort = data[823] != 0;
+                            db_props.insert(
+                                "presort_patterns".to_string(),
+                                if presort { 1.0 } else { 0.0 },
+                            );
+                            num_patterns =
+                                u32::from_le_bytes([data[824], data[825], data[826], data[827]])
+                                    as usize;
+                        }
+                        // ~560/568 bytes = standard tetra3 schema
+                        else if len >= 560 {
+                            let p_size = u16::from_le_bytes([data[256], data[257]]);
+                            db_props.insert("pattern_size".to_string(), p_size as f64);
+                            let p_bins = u16::from_le_bytes([data[258], data[259]]);
+                            db_props.insert("pattern_bins".to_string(), p_bins as f64);
+                            let p_max_err =
+                                f32::from_le_bytes([data[260], data[261], data[262], data[263]]);
+                            db_props.insert("pattern_max_error".to_string(), p_max_err as f64);
+                            let max_fov =
+                                f32::from_le_bytes([data[264], data[265], data[266], data[267]]);
+                            db_props.insert("max_fov".to_string(), max_fov as f64);
+                            let min_fov =
+                                f32::from_le_bytes([data[268], data[269], data[270], data[271]]);
+                            db_props.insert("min_fov".to_string(), min_fov as f64);
+                            let eq = u16::from_le_bytes([data[528], data[529]]);
+                            db_props.insert("epoch_equinox".to_string(), eq as f64);
+                            let pm =
+                                f32::from_le_bytes([data[530], data[531], data[532], data[533]]);
+                            db_props.insert("epoch_proper_motion".to_string(), pm as f64);
+                            let vs = u16::from_le_bytes([data[536], data[537]]);
+                            db_props.insert("verification_stars_per_fov".to_string(), vs as f64);
+                            let presort = data[559] != 0;
+                            db_props.insert(
+                                "presort_patterns".to_string(),
+                                if presort { 1.0 } else { 0.0 },
+                            );
+                            // num_patterns is already set globally based on pattern_catalog_arr.nrows() / 2
+                        }
                     }
                 }
             }
