@@ -5,10 +5,18 @@ edition = "2024"
 
 [dependencies]
 zip = "0.6"
-ndarray = "0.17.1"
+ndarray = { version = "0.17.1", features = ["rayon"] }
 npyz = "0.8"
 kiddo = "3.0"
 nalgebra = "0.34.1"
+rayon = "1.11.0"
 
 [build-dependencies]
 tonic-build = "0.11"
+
+[dev-dependencies]
+pyo3 = { version = "0.19", features = ["auto-initialize"] }
+numpy = "0.19"
+walkdir = "2.3"
+cedar_detect = { git = "https://github.com/smroid/cedar-detect" }
+image = "0.25.1"
