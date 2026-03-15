@@ -1,4 +1,4 @@
-// Required Notice: Copyright (c) 2026 Omair Kamil <oakamil@gmail.com>
+// Required Notice: Copyright (c) 2026 Omair Kamil
 //
 // This file is a derivative work - a port to Rust with heavy performance
 // optimizations from `tetra3.py` of the cedar-solve and esa/tetra3 projects.

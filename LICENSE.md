@@ -8,7 +8,7 @@ This software is dual-licensed depending on your use case:
 ---
 
 ## Required Notices
-**Required Notice: Copyright (c) 2026 Omair Kamil <oakamil@gmail.com>**
+**Required Notice: Copyright (c) 2026 Omair Kamil**
 
 *(Note: The above "Required Notice" must be retained in any distributed copies as per the PolyForm Noncommercial License terms).*
 

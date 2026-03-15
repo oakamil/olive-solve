@@ -1,4 +1,4 @@
-// Required Notice: Copyright (c) 2026 Omair Kamil <oakamil@gmail.com>
+// Required Notice: Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
 use image::GrayImage;
