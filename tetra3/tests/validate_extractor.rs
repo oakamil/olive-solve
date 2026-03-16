@@ -6,9 +6,14 @@ use ndarray::Array2;
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
+use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
+use zip::write::FileOptions;
+use zip::{CompressionMethod, ZipWriter};
 
 use cedar_detect::algorithm::{estimate_noise_from_image, get_stars_from_image};
 use tetra3::{CentroidConfig, Extractor};
@@ -81,6 +86,24 @@ def run_py_extraction_perf(image_array, downsample):
     # This ensures the timer strictly captures the algorithmic execution time.
     get_centroids_from_image(image_array, downsample=downsample, return_moments=True)
 "#;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PyCentroidResult {
+    pub y: f64,
+    pub x: f64,
+    pub sum: f64,
+    pub area: usize,
+    pub m2_xx: f64,
+    pub m2_yy: f64,
+    pub m2_xy: f64,
+    pub axis_ratio: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PyImageResult {
+    pub image_name: String,
+    pub centroids: Vec<PyCentroidResult>,
+}
 
 /// Helper function to locate and return the test images, maximizing code reuse across tests.
 fn get_test_images() -> Vec<PathBuf> {
@@ -520,7 +543,6 @@ fn test_extraction_against_python_binning() {
 }
 
 #[test]
-#[ignore]
 fn test_extraction_against_python_full() {
     // Tests all permutations of background subtraction and sigma thresholding.
     // This test takes > 15 minutes on a Raspberry Pi 5
@@ -773,4 +795,151 @@ fn test_performance_vs_cedar() {
         println!("Port Speedup vs Cedar      : {:.2}x", speedup);
         println!("==============================================\n");
     }
+}
+
+#[test]
+#[ignore]
+// Run intentionally via: cargo test generate_python_test_fixtures --release -- --ignored
+fn generate_python_test_fixtures() {
+    let bg_modes = [
+        (
+            Some(tetra3::extractor::BgSubMode::LocalMedian),
+            "local_median",
+        ),
+        (Some(tetra3::extractor::BgSubMode::LocalMean), "local_mean"),
+        (
+            Some(tetra3::extractor::BgSubMode::GlobalMedian),
+            "global_median",
+        ),
+        (
+            Some(tetra3::extractor::BgSubMode::GlobalMean),
+            "global_mean",
+        ),
+        (None, "None"),
+    ];
+
+    let sigma_modes = [
+        (
+            tetra3::extractor::SigmaMode::LocalMedianAbs,
+            "local_median_abs",
+        ),
+        (
+            tetra3::extractor::SigmaMode::LocalRootSquare,
+            "local_root_square",
+        ),
+        (
+            tetra3::extractor::SigmaMode::GlobalMedianAbs,
+            "global_median_abs",
+        ),
+        (
+            tetra3::extractor::SigmaMode::GlobalRootSquare,
+            "global_root_square",
+        ),
+    ];
+
+    let downsamples = [None, Some(2), Some(4)];
+
+    let image_paths = get_test_images();
+
+    // Create the directory where the zip files will be stored
+    let fixtures_dir = Path::new("tests/fixtures");
+    std::fs::create_dir_all(&fixtures_dir).unwrap();
+
+    Python::with_gil(|py| {
+        let module =
+            PyModule::from_code(py, PY_HELPER_CODE, "test_helper.py", "test_helper").unwrap();
+        let load_image_as_array = module.getattr("load_image_as_array").unwrap();
+        let run_py_extraction = module.getattr("run_py_extraction").unwrap();
+
+        for &ds_opt in &downsamples {
+            let ds_val = ds_opt.unwrap_or(1);
+            let py_ds = ds_opt.unwrap_or(0);
+
+            // Pre-load images for this downsample scale so we don't hit the disk
+            // and run NumPy cropping constantly for every bg/sigma mode permutation.
+            let mut loaded_py_images = Vec::new();
+            for path in &image_paths {
+                let img_name = path.file_name().unwrap().to_string_lossy().to_string();
+                let py_image_array: &PyAny = load_image_as_array
+                    .call1((path.to_str().unwrap(), ds_val))
+                    .unwrap();
+                loaded_py_images.push((img_name, py_image_array));
+            }
+
+            for (_bg_rs, bg_py) in &bg_modes {
+                for (_sig_rs, sig_py) in &sigma_modes {
+                    let ds_str = ds_opt
+                        .map(|d| d.to_string())
+                        .unwrap_or_else(|| "none".to_string());
+                    let zip_name = format!("py-{}-{}-{}.zip", bg_py, sig_py, ds_str);
+                    let zip_path = fixtures_dir.join(&zip_name);
+
+                    println!("Generating fixture: {}", zip_name);
+
+                    let mut all_results = Vec::new();
+
+                    for (img_name, py_image_array) in &loaded_py_images {
+                        let py_result = run_py_extraction
+                            .call1((*py_image_array, *bg_py, *sig_py, py_ds))
+                            .unwrap();
+
+                        // Map Python/NumPy returns strictly into native Rust memory
+                        let py_tuple: &PyTuple = py_result.downcast().unwrap();
+                        let py_centroids_arr: PyReadonlyArray2<f64> =
+                            py_tuple.get_item(0).unwrap().extract().unwrap();
+                        let py_moments_list: &PyList =
+                            py_tuple.get_item(1).unwrap().downcast().unwrap();
+
+                        let py_sum_arr: PyReadonlyArray1<f64> =
+                            py_moments_list.get_item(0).unwrap().extract().unwrap();
+                        let py_area_arr: PyReadonlyArray1<f64> =
+                            py_moments_list.get_item(1).unwrap().extract().unwrap();
+                        let py_m2_arr: PyReadonlyArray2<f64> =
+                            py_moments_list.get_item(2).unwrap().extract().unwrap();
+                        let py_ratio_arr: PyReadonlyArray1<f64> =
+                            py_moments_list.get_item(3).unwrap().extract().unwrap();
+
+                        let py_centroids_view = py_centroids_arr.as_array();
+                        let py_sum = py_sum_arr.as_array();
+                        let py_area = py_area_arr.as_array();
+                        let py_m2_view = py_m2_arr.as_array();
+                        let py_ratio = py_ratio_arr.as_array();
+
+                        let mut image_result = PyImageResult {
+                            image_name: img_name.clone(),
+                            centroids: Vec::with_capacity(py_centroids_view.shape()[0]),
+                        };
+
+                        // Transform the parallel arrays into an Array of Structs (AoS)
+                        for i in 0..py_centroids_view.shape()[0] {
+                            image_result.centroids.push(PyCentroidResult {
+                                y: *py_centroids_view.get([i, 0]).unwrap(),
+                                x: *py_centroids_view.get([i, 1]).unwrap(),
+                                sum: *py_sum.get(i).unwrap(),
+                                area: *py_area.get(i).unwrap() as usize,
+                                m2_xx: *py_m2_view.get([i, 0]).unwrap(),
+                                m2_yy: *py_m2_view.get([i, 1]).unwrap(),
+                                m2_xy: *py_m2_view.get([i, 2]).unwrap(),
+                                axis_ratio: *py_ratio.get(i).unwrap(),
+                            });
+                        }
+
+                        all_results.push(image_result);
+                    }
+
+                    // Serialize the batch of all images into the zip file
+                    let file = File::create(&zip_path).unwrap();
+                    let mut zip = ZipWriter::new(file);
+                    let options =
+                        FileOptions::default().compression_method(CompressionMethod::Deflated);
+
+                    // We store all images for this combination inside a single JSON file in the zip
+                    zip.start_file("results.json", options).unwrap();
+                    let json_bytes = serde_json::to_vec_pretty(&all_results).unwrap();
+                    zip.write_all(&json_bytes).unwrap();
+                    zip.finish().unwrap();
+                }
+            }
+        }
+    });
 }
