@@ -84,12 +84,12 @@ async fn test_solve_from_image_batch() -> Result<(), Box<dyn std::error::Error>>
     for img_path in entries {
         let file_name = img_path.file_name().unwrap().to_string_lossy().to_string();
 
-        // Load image and convert to 32-bit float grayscale
-        let img = image::open(&img_path)?.to_luma32f();
+        // Load image as 8-bit grayscale to preserve the 0-255 range
+        let img = image::open(&img_path)?.to_luma8();
         let (width, height) = img.dimensions();
 
-        // Safely extract the raw f32 slice directly
-        let pixel_data: &[f32] = img.as_raw().as_slice();
+        // Manually cast the u8 pixels to f32 to avoid the image crate's 0.0-1.0 normalization
+        let pixel_data: Vec<f32> = img.as_raw().iter().map(|&p| p as f32).collect();
         let byte_size = pixel_data.len() * std::mem::size_of::<f32>();
 
         // Create a unique shared memory segment for this image
@@ -210,13 +210,7 @@ async fn test_extract_then_solve() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "\n{:<40} | {:<10} | {:<8} | {:<8} | {:<12} | {:<12} | {:<12}",
-        "Image Name",
-        "Centroids",
-        "RA (°)",
-        "Dec (°)",
-        "Extract (ms)",
-        "Solve (ms)",
-        "Total (ms)"
+        "Image Name", "Centroids", "RA (°)", "Dec (°)", "Extract (ms)", "Solve (ms)", "Total (ms)"
     );
     println!("{:-<115}", "");
 
@@ -224,12 +218,12 @@ async fn test_extract_then_solve() -> Result<(), Box<dyn std::error::Error>> {
     for img_path in entries {
         let file_name = img_path.file_name().unwrap().to_string_lossy().to_string();
 
-        // Load image and convert to 32-bit float grayscale
-        let img = image::open(&img_path)?.to_luma32f();
+        // Load image as 8-bit grayscale to preserve the 0-255 range
+        let img = image::open(&img_path)?.to_luma8();
         let (width, height) = img.dimensions();
 
-        // Safely extract the raw f32 slice directly
-        let pixel_data: &[f32] = img.as_raw().as_slice();
+        // Manually cast the u8 pixels to f32 to avoid the image crate's 0.0-1.0 normalization
+        let pixel_data: Vec<f32> = img.as_raw().iter().map(|&p| p as f32).collect();
         let byte_size = pixel_data.len() * std::mem::size_of::<f32>();
 
         // Create a unique shared memory segment for this image
