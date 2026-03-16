@@ -1,9 +1,10 @@
 [workspace]
 members = [
     "tetra3",
+    "tetra3-py",
     "cedar-solver",
     "server"
-]
+, "tetra3-py"]
 resolver = "2"
 
 [profile.release]

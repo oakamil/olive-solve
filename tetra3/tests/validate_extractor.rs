@@ -3,9 +3,9 @@
 
 use image::GenericImageView;
 use ndarray::Array2;
-use numpy::{PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::types::{PyAnyMethods, PyList, PyListMethods, PyModule, PyTuple, PyTupleMethods};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Write;
@@ -18,7 +18,8 @@ use zip::{CompressionMethod, ZipWriter};
 use cedar_detect::algorithm::{estimate_noise_from_image, get_stars_from_image};
 use tetra3::{ExtractOptions, Extractor};
 
-const PY_HELPER_CODE: &str = r#"
+// Use Rust 1.77+ c"..." literals for PyO3 0.21+ CStr requirements
+const PY_HELPER_CODE: &std::ffi::CStr = cr#"
 import numpy as np
 from tetra3.tetra3 import get_centroids_from_image
 
@@ -492,7 +493,7 @@ fn test_extraction_against_python_full() {
 
 #[test]
 #[ignore]
-// Run intentionally via: cargo test generate_python_test_fixtures --release -- --ignored
+// Run intentionally via: cargo test generate_python_test_fixtures --release -- --ignored --nocapture
 // This test requires the tetra3 module to be loaded in the Python environment
 fn generate_python_test_fixtures() {
     let bg_modes = [
@@ -538,9 +539,11 @@ fn generate_python_test_fixtures() {
     let fixtures_dir = Path::new("tests/fixtures");
     std::fs::create_dir_all(&fixtures_dir).unwrap();
 
-    Python::with_gil(|py| {
+    // Ensure the freethreaded runtime is properly initialized before attaching
+    Python::initialize();
+    Python::attach(|py| {
         let module =
-            PyModule::from_code(py, PY_HELPER_CODE, "test_helper.py", "test_helper").unwrap();
+            PyModule::from_code(py, PY_HELPER_CODE, c"test_helper.py", c"test_helper").unwrap();
         let run_py_extraction = module.getattr("run_py_extraction").unwrap();
 
         for &ds_opt in &downsamples {
@@ -595,11 +598,11 @@ fn generate_python_test_fixtures() {
                             .call1((py_image_array, *bg_py, *sig_py, py_ds))
                             .unwrap();
 
-                        let py_tuple: &PyTuple = py_result.downcast().unwrap();
+                        let py_tuple = py_result.cast_into::<PyTuple>().unwrap();
                         let py_centroids_arr: PyReadonlyArray2<f64> =
                             py_tuple.get_item(0).unwrap().extract().unwrap();
-                        let py_moments_list: &PyList =
-                            py_tuple.get_item(1).unwrap().downcast().unwrap();
+                        let py_moments_list =
+                            py_tuple.get_item(1).unwrap().cast_into::<PyList>().unwrap();
 
                         let py_sum_arr: PyReadonlyArray1<f64> =
                             py_moments_list.get_item(0).unwrap().extract().unwrap();
@@ -675,9 +678,11 @@ fn test_performance_vs_python() {
         ..Default::default()
     };
 
-    Python::with_gil(|py| {
+    // Ensure the freethreaded runtime is properly initialized before attaching
+    Python::initialize();
+    Python::attach(|py| {
         let module =
-            PyModule::from_code(py, PY_HELPER_CODE, "test_helper.py", "test_helper").unwrap();
+            PyModule::from_code(py, PY_HELPER_CODE, c"test_helper.py", c"test_helper").unwrap();
         let run_py_extraction_perf = module.getattr("run_py_extraction_perf").unwrap();
 
         // Preload images to ensure disk I/O and numpy construction isn't counted in benchmarking loops
@@ -717,7 +722,7 @@ fn test_performance_vs_python() {
                 // Run Python Algorithm
                 let start_py = Instant::now();
                 let _py_result = run_py_extraction_perf
-                    .call1((*py_image_array, py_ds_arg))
+                    .call1((py_image_array.clone(), py_ds_arg))
                     .unwrap();
                 total_py_time += start_py.elapsed();
 

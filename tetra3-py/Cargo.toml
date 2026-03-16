@@ -1,0 +1,14 @@
+[package]
+name = "tetra3-py"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "tetra3"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Alias the core crate so it doesn't conflict with the Python module name
+tetra3_core = { path = "../tetra3", package = "tetra3" }
+pyo3 = { version = "0.28.2" }
+numpy = "0.28"

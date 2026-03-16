@@ -23,6 +23,9 @@ use tetra3_server::tetra3_server::{SolveRequest, SolveResult, SolveStatus as Pro
 use tetra3_server::tetra3_solver::Tetra3Solver;
 
 #[tokio::test]
+#[ignore]
+// Run using cargo test test_python_solver_consistency_with_testdata --release -- --ignored
+// Requires tetra3 module to be loaded in current Python environment
 async fn test_python_solver_consistency_with_testdata() {
     let db_path = Path::new("data/default_database.npz");
     if !db_path.exists() {
