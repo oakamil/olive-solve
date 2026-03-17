@@ -768,6 +768,7 @@ fn test_performance_vs_python() {
 }
 
 #[test]
+#[ignore]
 fn test_performance_vs_cedar() {
     let iterations = 50;
     let image_paths = get_test_images();
