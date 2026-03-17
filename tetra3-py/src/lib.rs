@@ -299,6 +299,7 @@ fn parse_solve_options(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<SolveOpti
 /// The module initialization function. This matches the name defined in Cargo.toml.
 /// This exposes the PyTetra3 class to Python under the name `Tetra3`.
 #[pymodule]
+#[pyo3(name = "tetra3")]
 fn tetra3(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTetra3>()?;
     Ok(())
