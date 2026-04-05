@@ -69,6 +69,7 @@
 
 use ndarray::{Array2, ArrayBase, Data, Ix2, s};
 use rayon::prelude::*;
+
 use std::cmp::Ordering;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,11 +171,32 @@ pub struct ExtractionResult {
     pub debug_images: Option<DebugImages>,
 }
 
-/// Helper: 2D Uniform Filter (Box Blur)
+/// Trait to allow our highly optimized spatial filters to transparently operate
+/// on either `u8` (Zero-copy ingestion) or `f32` (Standard/Downsampled modes)
+/// without duplicating hundreds of lines of code.
+pub trait ToF32 {
+    fn to_f32(self) -> f32;
+}
+
+impl ToF32 for f32 {
+    #[inline(always)]
+    fn to_f32(self) -> f32 {
+        self
+    }
+}
+
+impl ToF32 for u8 {
+    #[inline(always)]
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+}
+
+/// Helper: 2D Uniform Filter (Box Blur) - Generic over Source Type
 /// Optimized for ARM NEON: Uses simple indexing (no deep iterator zips) to guarantee LLVM auto-vectorization.
 /// Note: Reflect-edge padding is computed mathematically in-place, eliminating padded array allocations.
-fn fast_box_blur_2d(
-    src: &[f32],
+fn fast_box_blur_2d<T: Copy + ToF32 + Sync + Send>(
+    src: &[T],
     scratch: &mut [f32],
     out: &mut [f32],
     w: usize,
@@ -184,41 +206,47 @@ fn fast_box_blur_2d(
     let rad = size / 2;
     let area = (size * size) as f32;
 
-    // Horizontal Pass
+    // Horizontal Pass: Standard sliding sum (Cache friendly)
     scratch
         .par_chunks_exact_mut(w)
         .zip(src.par_chunks_exact(w))
         .for_each(|(s_row, i_row)| {
+            assert!(i_row.len() >= w);
+            assert!(s_row.len() >= w);
+
             let mut sum = 0.0_f32;
             if w > 2 * rad {
-                for x in 0..=rad {
-                    sum += i_row[x];
-                }
-                for x in 1..=rad {
-                    sum += i_row[x - 1];
-                } // Reflection
-                s_row[0] = sum;
+                unsafe {
+                    for x in 0..=rad {
+                        sum += i_row.get_unchecked(x).to_f32();
+                    }
+                    for x in 1..=rad {
+                        sum += i_row.get_unchecked(x - 1).to_f32();
+                    }
+                    *s_row.get_unchecked_mut(0) = sum;
 
-                for x in 1..=rad {
-                    sum += i_row[x + rad] - i_row[rad - x];
-                    s_row[x] = sum;
-                }
-                for x in (rad + 1)..(w - rad) {
-                    // Branchless inner core
-                    sum += i_row[x + rad] - i_row[x - rad - 1];
-                    s_row[x] = sum;
-                }
-                for x in (w - rad)..w {
-                    let add_px = if x + rad >= w {
-                        2 * w - 1 - (x + rad)
-                    } else {
-                        x + rad
-                    };
-                    sum += i_row[add_px] - i_row[x - rad - 1];
-                    s_row[x] = sum;
+                    for x in 1..=rad {
+                        sum += i_row.get_unchecked(x + rad).to_f32()
+                            - i_row.get_unchecked(rad - x).to_f32();
+                        *s_row.get_unchecked_mut(x) = sum;
+                    }
+                    for x in (rad + 1)..(w - rad) {
+                        sum += i_row.get_unchecked(x + rad).to_f32()
+                            - i_row.get_unchecked(x - rad - 1).to_f32();
+                        *s_row.get_unchecked_mut(x) = sum;
+                    }
+                    for x in (w - rad)..w {
+                        let add_px = if x + rad >= w {
+                            2 * w - 1 - (x + rad)
+                        } else {
+                            x + rad
+                        };
+                        sum += i_row.get_unchecked(add_px).to_f32()
+                            - i_row.get_unchecked(x - rad - 1).to_f32();
+                        *s_row.get_unchecked_mut(x) = sum;
+                    }
                 }
             } else {
-                // Fallback for extremely narrow images
                 let rad_i = rad as isize;
                 for x in -rad_i..=rad_i {
                     let px = if x < 0 {
@@ -228,7 +256,7 @@ fn fast_box_blur_2d(
                     } else {
                         x as usize
                     };
-                    sum += i_row[px];
+                    sum += i_row[px].to_f32();
                 }
                 s_row[0] = sum;
                 for x in 1..w {
@@ -244,71 +272,92 @@ fn fast_box_blur_2d(
                     } else {
                         sub_x as usize
                     };
-                    sum += i_row[add_px] - i_row[sub_px];
+                    sum += i_row[add_px].to_f32() - i_row[sub_px].to_f32();
                     s_row[x] = sum;
                 }
             }
         });
 
-    // Vertical Pass (Chunked via row-banding for parallelism without memory collisions)
-    let chunk_rows = (h + rayon::current_num_threads() - 1) / rayon::current_num_threads();
-    let chunk_rows = chunk_rows.max(16);
+    // Vertical Pass: Parallel over column strips for cache locality
+    let strip_width = 128;
+    let num_strips = (w + strip_width - 1) / strip_width;
 
-    out.par_chunks_mut(chunk_rows * w)
-        .enumerate()
-        .for_each(|(chunk_idx, o_chunk)| {
-            let start_y = chunk_idx * chunk_rows;
-            let end_y = start_y + (o_chunk.len() / w);
-            let mut col_sums = vec![0.0_f32; w];
+    // Cast the raw pointer to a primitive usize.
+    // This is completely Send + Sync and avoids Rust 2021's disjoint closure capture rules.
+    let out_ptr = out.as_mut_ptr() as usize;
 
-            for y in (start_y as isize - rad as isize)..=(start_y as isize + rad as isize) {
-                let py = if y < 0 {
-                    (-y - 1) as usize
-                } else if y >= h as isize {
-                    (2 * h as isize - 1 - y) as usize
-                } else {
-                    y as usize
-                };
-                let s_row = &scratch[py * w..(py + 1) * w];
-                for x in 0..w {
-                    col_sums[x] += s_row[x];
-                }
+    (0..num_strips).into_par_iter().for_each(|strip_idx| {
+        // Cast the usize back to a raw pointer and reconstruct the mutable slice
+        let out_slice = unsafe { std::slice::from_raw_parts_mut(out_ptr as *mut f32, w * h) };
+
+        let x_start = strip_idx * strip_width;
+        let x_end = (x_start + strip_width).min(w);
+        let current_strip_width = x_end - x_start;
+        let mut col_sums = vec![0.0_f32; current_strip_width];
+
+        // Initial vertical sums for the first row
+        for y in (-(rad as isize))..=(rad as isize) {
+            let py = if y < 0 {
+                (-y - 1) as usize
+            } else if y >= h as isize {
+                (2 * h as isize - 1 - y) as usize
+            } else {
+                y as usize
+            };
+            let s_row = &scratch[py * w + x_start..py * w + x_end];
+            for x in 0..current_strip_width {
+                col_sums[x] += s_row[x];
             }
+        }
 
-            let o_row = &mut o_chunk[0..w];
-            for x in 0..w {
-                o_row[x] = col_sums[x] / area;
+        let inv_area = 1.0 / area;
+
+        // First row output - Zipped for bounds-free auto-vectorization
+        let out_row = &mut out_slice[x_start..x_start + current_strip_width];
+        for (o, c) in out_row.iter_mut().zip(col_sums.iter()) {
+            *o = *c * inv_area;
+        }
+
+        for y in 1..h {
+            let add_y = (y as isize) + rad as isize;
+            let add_py = if add_y >= h as isize {
+                (2 * h as isize - 1 - add_y) as usize
+            } else {
+                add_y as usize
+            };
+            let sub_y = (y as isize) - rad as isize - 1;
+            let sub_py = if sub_y < 0 {
+                (-sub_y - 1) as usize
+            } else {
+                sub_y as usize
+            };
+
+            let add_row = &scratch[add_py * w + x_start..add_py * w + x_end];
+            let sub_row = &scratch[sub_py * w + x_start..sub_py * w + x_end];
+            let o_row_start = y * w + x_start;
+            let out_row = &mut out_slice[o_row_start..o_row_start + current_strip_width];
+
+            for (((o, c), a), s) in out_row
+                .iter_mut()
+                .zip(col_sums.iter_mut())
+                .zip(add_row.iter())
+                .zip(sub_row.iter())
+            {
+                *c += *a - *s;
+                *o = *c * inv_area;
             }
-
-            for y in (start_y + 1)..end_y {
-                let add_y = (y as isize) + rad as isize;
-                let add_py = if add_y >= h as isize {
-                    (2 * h as isize - 1 - add_y) as usize
-                } else {
-                    add_y as usize
-                };
-                let sub_y = (y as isize) - rad as isize - 1;
-                let sub_py = if sub_y < 0 {
-                    (-sub_y - 1) as usize
-                } else {
-                    sub_y as usize
-                };
-
-                let add_row = &scratch[add_py * w..(add_py + 1) * w];
-                let sub_row = &scratch[sub_py * w..(sub_py + 1) * w];
-                let local_y = y - start_y;
-                let o_row = &mut o_chunk[local_y * w..(local_y + 1) * w];
-
-                for x in 0..w {
-                    col_sums[x] += add_row[x] - sub_row[x];
-                    o_row[x] = col_sums[x] / area;
-                }
-            }
-        });
+        }
+    });
 }
 
-/// Helper: 2D Median Filter using raw slices
-fn fast_median_filter_2d(src: &[f32], out: &mut [f32], w: usize, h: usize, size: usize) {
+/// Helper: 2D Median Filter using raw slices - Generic over Source Type
+fn fast_median_filter_2d<T: Copy + ToF32 + Sync + Send>(
+    src: &[T],
+    out: &mut [f32],
+    w: usize,
+    h: usize,
+    size: usize,
+) {
     let pad = (size / 2) as isize;
     let mid = (size * size) / 2;
 
@@ -334,7 +383,11 @@ fn fast_median_filter_2d(src: &[f32], out: &mut [f32], w: usize, h: usize, size:
                         } else if sx >= w as isize {
                             sx = 2 * w as isize - 1 - sx;
                         }
-                        window[idx] = src[(sy as usize) * w + (sx as usize)];
+                        unsafe {
+                            window[idx] = src
+                                .get_unchecked((sy as usize) * w + (sx as usize))
+                                .to_f32();
+                        }
                         idx += 1;
                     }
                 }
@@ -349,12 +402,21 @@ fn fast_median_filter_2d(src: &[f32], out: &mut [f32], w: usize, h: usize, size:
 /// Extractor maintains pre-allocated global buffers to eliminate OS memory allocations
 /// during continuous execution, fulfilling the zero-allocation performance pattern.
 pub struct Extractor {
+    // Primary buffers for the Standard f32 pipeline & unified Math
     image_vec: Vec<f32>,
     scratch: Vec<f32>,
     median_scratch: Vec<f32>,
     std_img: Vec<f32>,
+
+    // Shared state variables
     mask: Vec<bool>,
     stack: Vec<usize>, // Tiny stack size keeps the L1 cache hot on Pi (bandwidth constrained)
+}
+
+impl Default for Extractor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Extractor {
@@ -369,7 +431,7 @@ impl Extractor {
         }
     }
 
-    /// Extract spot centroids from an image and calculate statistics.
+    /// Primary Extraction method for standard `f32` Floating-Point image inputs.
     pub fn extract<S>(
         &mut self,
         input_image: &ArrayBase<S, Ix2>,
@@ -421,7 +483,6 @@ impl Extractor {
             final_offs_w..final_offs_w + width
         ]);
 
-        self.image_vec.clear();
         if let Some(ds) = options.downsample {
             height /= ds;
             width /= ds;
@@ -438,22 +499,206 @@ impl Extractor {
                                 sum += cropped[[y * ds + dy, x * ds + dx]];
                             }
                         }
-                        // Hardcoded `sum_when_downsample = true` (mathematically identical to Python wrapper)
                         row[x] = sum;
                     }
                 });
         } else {
-            // Memory Optimization: Eliminate unnecessary zeroing memset
+            self.image_vec.resize(height * width, 0.0);
             if let Some(s) = cropped.as_slice() {
-                self.image_vec.extend_from_slice(s);
+                self.image_vec.copy_from_slice(s);
             } else {
-                self.image_vec.reserve(height * width);
-                for row in cropped.rows() {
-                    self.image_vec.extend(row.iter().copied());
+                for (out_row, in_row) in self
+                    .image_vec
+                    .chunks_exact_mut(width)
+                    .zip(cropped.axis_iter(ndarray::Axis(0)))
+                {
+                    out_row.copy_from_slice(in_row.as_slice().unwrap());
                 }
             }
         }
 
+        // Handoff to shared Core execution pipeline
+        self.extract_f32_pipeline(width, height, final_offs_w, final_offs_h, options)
+    }
+
+    /// Optimized entry point for 8-bit `u8` sensor data (True Mono, YUY420 luma, etc.)
+    pub fn extract_u8<S>(
+        &mut self,
+        input_image: &ArrayBase<S, Ix2>,
+        options: ExtractOptions,
+    ) -> ExtractionResult
+    where
+        S: Data<Elem = u8>,
+    {
+        // Crop and bounds logic (identical mathematical behavior)
+        let (full_height, full_width) = input_image.dim();
+
+        let (mut height, mut width, offs_h_isize, offs_w_isize) = match options.crop {
+            Some(Crop::Fraction(f)) => (full_height / f, full_width / f, 0isize, 0isize),
+            Some(Crop::Center {
+                height: h,
+                width: w,
+            }) => (h, w, 0isize, 0isize),
+            Some(Crop::Region {
+                height: h,
+                width: w,
+                offset_y,
+                offset_x,
+            }) => (h, w, offset_y, offset_x),
+            None => (full_height, full_width, 0isize, 0isize),
+        };
+
+        let final_offs_h;
+        let final_offs_w;
+
+        if options.crop.is_some() {
+            let divisor = options.downsample.unwrap_or(2);
+            height = ((height as f32 / divisor as f32).ceil() as usize) * divisor;
+            width = ((width as f32 / divisor as f32).ceil() as usize) * divisor;
+            height = height.min(full_height);
+            width = width.min(full_width);
+
+            final_offs_h = (offs_h_isize + (full_height as isize - height as isize) / 2)
+                .clamp(0, (full_height - height) as isize) as usize;
+            final_offs_w = (offs_w_isize + (full_width as isize - width as isize) / 2)
+                .clamp(0, (full_width - width) as isize) as usize;
+        } else {
+            final_offs_h = 0;
+            final_offs_w = 0;
+        }
+
+        let cropped = input_image.slice(s![
+            final_offs_h..final_offs_h + height,
+            final_offs_w..final_offs_w + width
+        ]);
+
+        if let Some(ds) = options.downsample {
+            // Late-Promotion Path (For downsampled sources)
+            let out_height = height / ds;
+            let out_width = width / ds;
+
+            self.image_vec.resize(out_height * out_width, 0.0);
+
+            if let Some(s) = cropped.as_slice() {
+                // OPTIMIZATION: Manually unrolled 2x and 4x paths.
+                // Eradicates inner variable loops, allowing the compiler to use direct SIMD load-adds.
+                let w = width;
+                if ds == 2 {
+                    self.image_vec
+                        .par_chunks_exact_mut(out_width)
+                        .enumerate()
+                        .for_each(|(out_y, row)| {
+                            let start_y = out_y * 2;
+                            for out_x in 0..out_width {
+                                let start_x = out_x * 2;
+                                unsafe {
+                                    let r1 = start_y * w + start_x;
+                                    let r2 = (start_y + 1) * w + start_x;
+                                    let sum = *s.get_unchecked(r1) as u32
+                                        + *s.get_unchecked(r1 + 1) as u32
+                                        + *s.get_unchecked(r2) as u32
+                                        + *s.get_unchecked(r2 + 1) as u32;
+                                    *row.get_unchecked_mut(out_x) = sum as f32;
+                                }
+                            }
+                        });
+                } else if ds == 4 {
+                    self.image_vec
+                        .par_chunks_exact_mut(out_width)
+                        .enumerate()
+                        .for_each(|(out_y, row)| {
+                            let start_y = out_y * 4;
+                            for out_x in 0..out_width {
+                                let start_x = out_x * 4;
+                                let mut sum = 0u32;
+                                unsafe {
+                                    for dy in 0..4 {
+                                        let r = (start_y + dy) * w + start_x;
+                                        sum += *s.get_unchecked(r) as u32
+                                            + *s.get_unchecked(r + 1) as u32
+                                            + *s.get_unchecked(r + 2) as u32
+                                            + *s.get_unchecked(r + 3) as u32;
+                                    }
+                                    *row.get_unchecked_mut(out_x) = sum as f32;
+                                }
+                            }
+                        });
+                } else {
+                    self.image_vec
+                        .par_chunks_exact_mut(out_width)
+                        .enumerate()
+                        .for_each(|(out_y, row)| {
+                            let start_y = out_y * ds;
+                            for out_x in 0..out_width {
+                                let mut sum: u32 = 0;
+                                let start_x = out_x * ds;
+                                for dy in 0..ds {
+                                    let row_offset = (start_y + dy) * w;
+                                    for dx in 0..ds {
+                                        unsafe {
+                                            sum +=
+                                                *s.get_unchecked(row_offset + start_x + dx) as u32;
+                                        }
+                                    }
+                                }
+                                row[out_x] = sum as f32;
+                            }
+                        });
+                }
+            } else {
+                // Fallback for non-contiguous views
+                self.image_vec
+                    .par_chunks_exact_mut(out_width)
+                    .enumerate()
+                    .for_each(|(y, row)| {
+                        for x in 0..out_width {
+                            let mut sum: u32 = 0;
+                            for dy in 0..ds {
+                                for dx in 0..ds {
+                                    sum += cropped[[y * ds + dy, x * ds + dx]] as u32;
+                                }
+                            }
+                            row[x] = sum as f32;
+                        }
+                    });
+            }
+
+            self.extract_f32_pipeline(out_width, out_height, final_offs_w, final_offs_h, options)
+        } else {
+            // Fast Promotion Path (1x Mode)
+            // Using heavily vectorized parallel conversion to f32.
+            self.image_vec.resize(height * width, 0.0);
+            if let Some(s) = cropped.as_slice() {
+                self.image_vec
+                    .par_iter_mut()
+                    .zip(s.par_iter())
+                    .for_each(|(out, &in_val)| {
+                        *out = in_val as f32;
+                    });
+            } else {
+                for (out_row, in_row) in self
+                    .image_vec
+                    .chunks_exact_mut(width)
+                    .zip(cropped.axis_iter(ndarray::Axis(0)))
+                {
+                    for (out_val, &in_val) in out_row.iter_mut().zip(in_row.iter()) {
+                        *out_val = in_val as f32;
+                    }
+                }
+            }
+            self.extract_f32_pipeline(width, height, final_offs_w, final_offs_h, options)
+        }
+    }
+
+    /// Shared internal pipeline containing Steps 2-9 for standard f32 inputs or Late-Promotion formats.
+    fn extract_f32_pipeline(
+        &mut self,
+        width: usize,
+        height: usize,
+        final_offs_w: usize,
+        final_offs_h: usize,
+        options: ExtractOptions,
+    ) -> ExtractionResult {
         let dbg_cropped = if options.return_images {
             Some(Array2::from_shape_vec((height, width), self.image_vec.clone()).unwrap())
         } else {
@@ -461,44 +706,48 @@ impl Extractor {
         };
 
         // 2. Subtract background
-        // Fused background subtraction + RMS calculation (Evaluated as an expression)
         let sum_sq_global: f64 = if let Some(mode) = options.bg_sub_mode {
             match mode {
                 BgSubMode::LocalMean => {
                     self.scratch.resize(width * height, 0.0);
-                    let rad = options.filtsize / 2;
                     let area = (options.filtsize * options.filtsize) as f32;
 
                     self.scratch
                         .par_chunks_exact_mut(width)
                         .zip(self.image_vec.par_chunks_exact(width))
                         .for_each(|(s_row, i_row)| {
+                            let rad = options.filtsize / 2;
                             let mut sum = 0.0_f32;
                             if width > 2 * rad {
-                                for x in 0..=rad {
-                                    sum += i_row[x];
-                                }
-                                for x in 1..=rad {
-                                    sum += i_row[x - 1];
-                                }
-                                s_row[0] = sum;
+                                unsafe {
+                                    for x in 0..=rad {
+                                        sum += *i_row.get_unchecked(x);
+                                    }
+                                    for x in 1..=rad {
+                                        sum += *i_row.get_unchecked(x - 1);
+                                    }
+                                    *s_row.get_unchecked_mut(0) = sum;
 
-                                for x in 1..=rad {
-                                    sum += i_row[x + rad] - i_row[rad - x];
-                                    s_row[x] = sum;
-                                }
-                                for x in (rad + 1)..(width - rad) {
-                                    sum += i_row[x + rad] - i_row[x - rad - 1];
-                                    s_row[x] = sum;
-                                }
-                                for x in (width - rad)..width {
-                                    let add_px = if x + rad >= width {
-                                        2 * width - 1 - (x + rad)
-                                    } else {
-                                        x + rad
-                                    };
-                                    sum += i_row[add_px] - i_row[x - rad - 1];
-                                    s_row[x] = sum;
+                                    for x in 1..=rad {
+                                        sum += *i_row.get_unchecked(x + rad)
+                                            - *i_row.get_unchecked(rad - x);
+                                        *s_row.get_unchecked_mut(x) = sum;
+                                    }
+                                    for x in (rad + 1)..(width - rad) {
+                                        sum += *i_row.get_unchecked(x + rad)
+                                            - *i_row.get_unchecked(x - rad - 1);
+                                        *s_row.get_unchecked_mut(x) = sum;
+                                    }
+                                    for x in (width - rad)..width {
+                                        let add_px = if x + rad >= width {
+                                            2 * width - 1 - (x + rad)
+                                        } else {
+                                            x + rad
+                                        };
+                                        sum += *i_row.get_unchecked(add_px)
+                                            - *i_row.get_unchecked(x - rad - 1);
+                                        *s_row.get_unchecked_mut(x) = sum;
+                                    }
                                 }
                             } else {
                                 let rad_i = rad as isize;
@@ -532,10 +781,11 @@ impl Extractor {
                             }
                         });
 
-                    let chunk_rows =
-                        (height + rayon::current_num_threads() - 1) / rayon::current_num_threads();
+                    let chunk_rows = height.div_ceil(rayon::current_num_threads());
                     let chunk_rows = chunk_rows.max(16);
                     let scratch_ref = &self.scratch;
+                    let rad = options.filtsize / 2;
+                    let inv_area = 1.0 / area;
 
                     self.image_vec
                         .par_chunks_mut(chunk_rows * width)
@@ -565,10 +815,10 @@ impl Extractor {
 
                             {
                                 let i_row = &mut i_chunk[0..width];
-                                for x in 0..width {
-                                    let val = i_row[x] - (col_sums[x] / area);
-                                    i_row[x] = val;
-                                    local_sq_sum += (val as f64) * (val as f64);
+                                for (i, c) in i_row.iter_mut().zip(col_sums.iter()) {
+                                    let val = *i - (*c * inv_area);
+                                    *i = val;
+                                    local_sq_sum += (val * val) as f64;
                                 }
                             }
 
@@ -591,11 +841,16 @@ impl Extractor {
                                 let local_y = y - start_y;
                                 let i_row = &mut i_chunk[local_y * width..(local_y + 1) * width];
 
-                                for x in 0..width {
-                                    col_sums[x] += add_row[x] - sub_row[x];
-                                    let val = i_row[x] - (col_sums[x] / area);
-                                    i_row[x] = val;
-                                    local_sq_sum += (val as f64) * (val as f64);
+                                for (((i, c), a), s) in i_row
+                                    .iter_mut()
+                                    .zip(col_sums.iter_mut())
+                                    .zip(add_row.iter())
+                                    .zip(sub_row.iter())
+                                {
+                                    *c += *a - *s;
+                                    let val = *i - (*c * inv_area);
+                                    *i = val;
+                                    local_sq_sum += (val * val) as f64;
                                 }
                             }
                             local_sq_sum
@@ -615,7 +870,7 @@ impl Extractor {
                         .par_iter_mut()
                         .map(|i| {
                             *i -= median;
-                            (*i as f64) * (*i as f64)
+                            (*i * *i) as f64
                         })
                         .sum()
                 }
@@ -626,14 +881,14 @@ impl Extractor {
                         .par_iter_mut()
                         .map(|i| {
                             *i -= mean;
-                            (*i as f64) * (*i as f64)
+                            (*i * *i) as f64
                         })
                         .sum()
                 }
                 BgSubMode::LocalMedian => {
                     self.scratch.resize(width * height, 0.0);
                     fast_median_filter_2d(
-                        &self.image_vec,
+                        self.image_vec.as_slice(),
                         &mut self.scratch,
                         width,
                         height,
@@ -645,16 +900,13 @@ impl Extractor {
                         .zip(bg.par_iter())
                         .map(|(i, &b)| {
                             *i -= b;
-                            (*i as f64) * (*i as f64)
+                            (*i * *i) as f64
                         })
                         .sum()
                 }
             }
         } else {
-            self.image_vec
-                .par_iter()
-                .map(|&i| (i as f64) * (i as f64))
-                .sum()
+            self.image_vec.par_iter().map(|&i| (i * i) as f64).sum()
         };
 
         let dbg_bg_sub = if options.return_images {
@@ -693,7 +945,7 @@ impl Extractor {
                     self.scratch.clear();
                     self.scratch.extend(self.image_vec.iter().map(|v| v.abs()));
                     fast_median_filter_2d(
-                        &self.scratch,
+                        self.scratch.as_slice(),
                         &mut self.std_img,
                         width,
                         height,
@@ -710,7 +962,7 @@ impl Extractor {
                     self.scratch.extend(self.image_vec.iter().map(|v| v * v));
                     self.median_scratch.resize(width * height, 0.0);
                     fast_box_blur_2d(
-                        &self.scratch,
+                        self.scratch.as_slice(),
                         &mut self.median_scratch,
                         &mut self.std_img,
                         width,
@@ -726,14 +978,12 @@ impl Extractor {
         };
 
         // 4. Threshold to find binary mask
-        // Fused Fast Extraction: Evaluates Threshold + Binary Erosion (3x3 cross) in a single pass.
         let chunk_size = (height / rayon::current_num_threads()).max(64);
 
         let eroded_pixels: Vec<usize> = match threshold {
             Threshold::Scalar(th) => {
                 if options.binary_open {
-                    let chunks = (height.saturating_sub(2) + chunk_size - 1) / chunk_size;
-
+                    let chunks = height.saturating_sub(2).div_ceil(chunk_size);
                     (0..chunks)
                         .into_par_iter()
                         .fold(
@@ -744,20 +994,23 @@ impl Extractor {
                                 for y in start_y..end_y {
                                     let row_offset = y * width;
 
-                                    // Optimization: Extracting exact row slices enables the compiler to mathematically prove
-                                    // boundary safety, entirely stripping vector bounds checks from the inner `x` loop.
-                                    let r_prev = &self.image_vec[(y - 1) * width..y * width];
-                                    let r_curr = &self.image_vec[y * width..(y + 1) * width];
-                                    let r_next = &self.image_vec[(y + 1) * width..(y + 2) * width];
+                                    let p_prev =
+                                        self.image_vec[(y - 1) * width..y * width].as_ptr();
+                                    let p_curr =
+                                        self.image_vec[y * width..(y + 1) * width].as_ptr();
+                                    let p_next =
+                                        self.image_vec[(y + 1) * width..(y + 2) * width].as_ptr();
 
                                     for x in 1..width - 1 {
-                                        if r_curr[x] > th {
-                                            if r_curr[x - 1] > th
-                                                && r_curr[x + 1] > th
-                                                && r_prev[x] > th
-                                                && r_next[x] > th
-                                            {
-                                                acc.push(row_offset + x);
+                                        unsafe {
+                                            if *p_curr.add(x) > th {
+                                                if *p_curr.add(x - 1) > th
+                                                    && *p_curr.add(x + 1) > th
+                                                    && *p_prev.add(x) > th
+                                                    && *p_next.add(x) > th
+                                                {
+                                                    acc.push(row_offset + x);
+                                                }
                                             }
                                         }
                                     }
@@ -765,15 +1018,12 @@ impl Extractor {
                                 acc
                             },
                         )
-                        .reduce(
-                            || Vec::new(),
-                            |mut a, mut b| {
-                                a.append(&mut b);
-                                a
-                            },
-                        )
+                        .reduce(Vec::new, |mut a, mut b| {
+                            a.append(&mut b);
+                            a
+                        })
                 } else {
-                    let chunks = (height + chunk_size - 1) / chunk_size;
+                    let chunks = height.div_ceil(chunk_size);
                     (0..chunks)
                         .into_par_iter()
                         .fold(
@@ -794,19 +1044,15 @@ impl Extractor {
                                 acc
                             },
                         )
-                        .reduce(
-                            || Vec::new(),
-                            |mut a, mut b| {
-                                a.append(&mut b);
-                                a
-                            },
-                        )
+                        .reduce(Vec::new, |mut a, mut b| {
+                            a.append(&mut b);
+                            a
+                        })
                 }
             }
             Threshold::Array(arr) => {
                 if options.binary_open {
-                    let chunks = (height.saturating_sub(2) + chunk_size - 1) / chunk_size;
-
+                    let chunks = height.saturating_sub(2).div_ceil(chunk_size);
                     (0..chunks)
                         .into_par_iter()
                         .fold(
@@ -817,23 +1063,27 @@ impl Extractor {
                                 for y in start_y..end_y {
                                     let row_offset = y * width;
 
-                                    // Optimization: Complete bounds-check elimination via exact slice lengths
-                                    let r_prev = &self.image_vec[(y - 1) * width..y * width];
-                                    let r_curr = &self.image_vec[y * width..(y + 1) * width];
-                                    let r_next = &self.image_vec[(y + 1) * width..(y + 2) * width];
+                                    let p_prev =
+                                        self.image_vec[(y - 1) * width..y * width].as_ptr();
+                                    let p_curr =
+                                        self.image_vec[y * width..(y + 1) * width].as_ptr();
+                                    let p_next =
+                                        self.image_vec[(y + 1) * width..(y + 2) * width].as_ptr();
 
-                                    let t_prev = &arr[(y - 1) * width..y * width];
-                                    let t_curr = &arr[y * width..(y + 1) * width];
-                                    let t_next = &arr[(y + 1) * width..(y + 2) * width];
+                                    let t_prev = arr[(y - 1) * width..y * width].as_ptr();
+                                    let t_curr = arr[y * width..(y + 1) * width].as_ptr();
+                                    let t_next = arr[(y + 1) * width..(y + 2) * width].as_ptr();
 
                                     for x in 1..width - 1 {
-                                        if r_curr[x] > t_curr[x] {
-                                            if r_curr[x - 1] > t_curr[x - 1]
-                                                && r_curr[x + 1] > t_curr[x + 1]
-                                                && r_prev[x] > t_prev[x]
-                                                && r_next[x] > t_next[x]
-                                            {
-                                                acc.push(row_offset + x);
+                                        unsafe {
+                                            if *p_curr.add(x) > *t_curr.add(x) {
+                                                if *p_curr.add(x - 1) > *t_curr.add(x - 1)
+                                                    && *p_curr.add(x + 1) > *t_curr.add(x + 1)
+                                                    && *p_prev.add(x) > *t_prev.add(x)
+                                                    && *p_next.add(x) > *t_next.add(x)
+                                                {
+                                                    acc.push(row_offset + x);
+                                                }
                                             }
                                         }
                                     }
@@ -841,15 +1091,12 @@ impl Extractor {
                                 acc
                             },
                         )
-                        .reduce(
-                            || Vec::new(),
-                            |mut a, mut b| {
-                                a.append(&mut b);
-                                a
-                            },
-                        )
+                        .reduce(Vec::new, |mut a, mut b| {
+                            a.append(&mut b);
+                            a
+                        })
                 } else {
-                    let chunks = (height + chunk_size - 1) / chunk_size;
+                    let chunks = height.div_ceil(chunk_size);
                     (0..chunks)
                         .into_par_iter()
                         .fold(
@@ -871,33 +1118,36 @@ impl Extractor {
                                 acc
                             },
                         )
-                        .reduce(
-                            || Vec::new(),
-                            |mut a, mut b| {
-                                a.append(&mut b);
-                                a
-                            },
-                        )
+                        .reduce(Vec::new, |mut a, mut b| {
+                            a.append(&mut b);
+                            a
+                        })
                 }
             }
         };
 
-        // Helper: Binary Dilation (3x3 cross)
-        // Instant Dilation Matrix mapped linearly via fast index marking
+        // Binary Dilation
         self.mask.resize(width * height, false);
         self.mask.fill(false);
 
+        // OPTIMIZATION: Raw pointers bypass heavy boundary assertions during array dilation.
         if options.binary_open {
+            let mask_ptr = self.mask.as_mut_ptr();
             for &i in &eroded_pixels {
-                self.mask[i] = true;
-                self.mask[i - 1] = true;
-                self.mask[i + 1] = true;
-                self.mask[i - width] = true;
-                self.mask[i + width] = true;
+                unsafe {
+                    *mask_ptr.add(i) = true;
+                    *mask_ptr.add(i - 1) = true;
+                    *mask_ptr.add(i + 1) = true;
+                    *mask_ptr.add(i - width) = true;
+                    *mask_ptr.add(i + width) = true;
+                }
             }
         } else {
+            let mask_ptr = self.mask.as_mut_ptr();
             for &i in &eroded_pixels {
-                self.mask[i] = true;
+                unsafe {
+                    *mask_ptr.add(i) = true;
+                }
             }
         }
 
@@ -910,7 +1160,6 @@ impl Extractor {
         let mut extracted = Vec::new();
 
         // 5. Label regions & 6. Accumulate statistics
-        // Helper: 4-Connected Components Labeling & Centered Moments executed in a single pass
         for &seed in &eroded_pixels {
             if !self.mask[seed] {
                 continue;
@@ -924,7 +1173,6 @@ impl Extractor {
             let sx = (seed % width) as f64;
             let sy = (seed / width) as f64;
 
-            // Apply Parallel Axis Theorem to accumulate variances in single loop
             let mut sum_x = sx * val;
             let mut sum_y = sy * val;
             let mut sum_xx = sx * sx * val;
@@ -938,11 +1186,11 @@ impl Extractor {
                 let cy = idx / width;
                 let cx = idx % width;
 
-                let mut check_push = |ni: usize, nx: f64, ny: f64| {
-                    if self.mask[ni] {
-                        self.mask[ni] = false;
+                let mut check_push = |ni: usize, nx: f64, ny: f64| unsafe {
+                    if *self.mask.get_unchecked(ni) {
+                        *self.mask.get_unchecked_mut(ni) = false;
                         area += 1;
-                        let v = self.image_vec[ni] as f64;
+                        let v = *self.image_vec.get_unchecked(ni) as f64;
                         sum += v;
                         sum_x += nx * v;
                         sum_y += ny * v;
@@ -967,36 +1215,37 @@ impl Extractor {
                 }
             }
 
-            if let Some(min_a) = options.min_area {
-                if area < min_a {
-                    continue;
-                }
+            if let Some(min_a) = options.min_area
+                && area < min_a
+            {
+                continue;
             }
-            if let Some(max_a) = options.max_area {
-                if area > max_a {
-                    continue;
-                }
+            if let Some(max_a) = options.max_area
+                && area > max_a
+            {
+                continue;
             }
-            if let Some(min_s) = options.min_sum {
-                if sum < min_s {
-                    continue;
-                }
+            if let Some(min_s) = options.min_sum
+                && sum < min_s
+            {
+                continue;
             }
-            if let Some(max_s) = options.max_sum {
-                if sum > max_s {
-                    continue;
-                }
+            if let Some(max_s) = options.max_sum
+                && sum > max_s
+            {
+                continue;
             }
             if sum == 0.0 {
                 continue;
             }
 
-            let m1_x = sum_x / sum;
-            let m1_y = sum_y / sum;
+            let inv_sum = 1.0 / sum;
+            let m1_x = sum_x * inv_sum;
+            let m1_y = sum_y * inv_sum;
 
-            let m2_xx = (sum_xx / sum - m1_x * m1_x).max(0.0);
-            let m2_yy = (sum_yy / sum - m1_y * m1_y).max(0.0);
-            let m2_xy = sum_xy / sum - m1_x * m1_y;
+            let m2_xx = (sum_xx * inv_sum - m1_x * m1_x).max(0.0);
+            let m2_yy = (sum_yy * inv_sum - m1_y * m1_y).max(0.0);
+            let m2_xy = sum_xy * inv_sum - m1_x * m1_y;
 
             let diff = m2_xx - m2_yy;
             let root = (diff * diff + 4.0 * m2_xy * m2_xy).sqrt();
@@ -1004,10 +1253,10 @@ impl Extractor {
             let minor = (2.0 * 0f64.max(m2_xx + m2_yy - root)).sqrt();
             let axis_ratio = major / minor.max(1e-9);
 
-            if let Some(max_ar) = options.max_axis_ratio {
-                if axis_ratio > max_ar || minor <= 0.0 {
-                    continue;
-                }
+            if let Some(max_ar) = options.max_axis_ratio
+                && (axis_ratio > max_ar || minor <= 0.0)
+            {
+                continue;
             }
 
             extracted.push(CentroidResult {
@@ -1058,8 +1307,9 @@ impl Extractor {
                 }
 
                 if img_sum > 0.0 {
-                    centroid.x = sum_xc / img_sum + o_x as f64;
-                    centroid.y = sum_yc / img_sum + o_y as f64;
+                    let inv_img_sum = 1.0 / img_sum;
+                    centroid.x = sum_xc * inv_img_sum + o_x as f64;
+                    centroid.y = sum_yc * inv_img_sum + o_y as f64;
                 }
             }
         }

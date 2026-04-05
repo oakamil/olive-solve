@@ -993,26 +993,26 @@ impl Solver {
 
             // Fallback 1: Try u8 (tetra3 uses this for very small catalogs)
             let mut cursor = Cursor::new(&buf);
-            if let Ok(npy) = NpyFile::new(&mut cursor) {
-                if let Ok(data_u8) = npy.into_vec::<u8>() {
-                    let data: Vec<usize> = data_u8.into_iter().map(|v| v as usize).collect();
-                    return Ok(Array2::from_shape_vec(
-                        (shape[0] as usize, shape[1] as usize),
-                        data,
-                    )?);
-                }
+            if let Ok(npy) = NpyFile::new(&mut cursor)
+                && let Ok(data_u8) = npy.into_vec::<u8>()
+            {
+                let data: Vec<usize> = data_u8.into_iter().map(|v| v as usize).collect();
+                return Ok(Array2::from_shape_vec(
+                    (shape[0] as usize, shape[1] as usize),
+                    data,
+                )?);
             }
 
             // Fallback 2: Try u16
             let mut cursor = Cursor::new(&buf);
-            if let Ok(npy) = NpyFile::new(&mut cursor) {
-                if let Ok(data_u16) = npy.into_vec::<u16>() {
-                    let data: Vec<usize> = data_u16.into_iter().map(|v| v as usize).collect();
-                    return Ok(Array2::from_shape_vec(
-                        (shape[0] as usize, shape[1] as usize),
-                        data,
-                    )?);
-                }
+            if let Ok(npy) = NpyFile::new(&mut cursor)
+                && let Ok(data_u16) = npy.into_vec::<u16>()
+            {
+                let data: Vec<usize> = data_u16.into_iter().map(|v| v as usize).collect();
+                return Ok(Array2::from_shape_vec(
+                    (shape[0] as usize, shape[1] as usize),
+                    data,
+                )?);
             }
 
             // Fallback 3: Try u32
@@ -1530,14 +1530,14 @@ impl Solver {
                 // This entire path is extremely fast on current hardware,
                 // completing in well under 1ms. Timeout and cancellation aren't
                 // real possibilities but they're kept here for completeness.
-                if let Some(timeout) = options.solve_timeout_ms {
-                    if t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout {
-                        return Solution {
-                            status: SolveStatus::Timeout,
-                            t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
-                            ..Default::default()
-                        };
-                    }
+                if let Some(timeout) = options.solve_timeout_ms
+                    && t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout
+                {
+                    return Solution {
+                        status: SolveStatus::Timeout,
+                        t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                        ..Default::default()
+                    };
                 }
                 if self.cancelled.load(Ordering::Relaxed) {
                     return Solution {
@@ -1772,14 +1772,14 @@ impl Solver {
         else {
             for image_pattern_indices in breadth_first_combinations(&pattern_centroids_inds, p_size)
             {
-                if let Some(timeout) = options.solve_timeout_ms {
-                    if t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout {
-                        return Solution {
-                            status: SolveStatus::Timeout,
-                            t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
-                            ..Default::default()
-                        };
-                    }
+                if let Some(timeout) = options.solve_timeout_ms
+                    && t0_solve.elapsed().as_secs_f64() * 1000.0 > timeout
+                {
+                    return Solution {
+                        status: SolveStatus::Timeout,
+                        t_solve_ms: t0_solve.elapsed().as_secs_f64() * 1000.0,
+                        ..Default::default()
+                    };
                 }
                 if self.cancelled.load(Ordering::Relaxed) {
                     return Solution {

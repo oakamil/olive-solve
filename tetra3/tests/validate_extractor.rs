@@ -16,7 +16,7 @@ use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use cedar_detect::algorithm::{estimate_noise_from_image, get_stars_from_image};
-use tetra3::{ExtractOptions, Extractor};
+use tetra3::{ExtractOptions, Extractor, SolveOptions, SolveStatus, Solver};
 
 // Use Rust 1.77+ c"..." literals for PyO3 0.21+ CStr requirements
 const PY_HELPER_CODE: &std::ffi::CStr = cr#"
@@ -124,7 +124,7 @@ fn run_validation_suite_from_fixtures(
     // are not counted in the total extraction benchmarking time.
     let mut base_images = Vec::new();
     for path in &image_paths {
-        let img = image::open(&path).unwrap();
+        let img = image::open(path).unwrap();
         let img_name = path.file_name().unwrap().to_string_lossy().to_string();
         base_images.push((img_name, img));
     }
@@ -491,6 +491,126 @@ fn test_extraction_against_python_full() {
     run_validation_suite_from_fixtures(&bg_modes, &sigma_modes, &downsamples);
 }
 
+fn run_validation_suite_u8(
+    bg_modes: &[(Option<tetra3::extractor::BgSubMode>, &str)],
+    sigma_modes: &[(tetra3::extractor::SigmaMode, &str)],
+    downsamples: &[Option<usize>],
+) {
+    let image_paths = get_test_images();
+
+    let mut base_images = Vec::new();
+    for path in &image_paths {
+        let img = image::open(path).unwrap();
+        let img_name = path.file_name().unwrap().to_string_lossy().to_string();
+        base_images.push((img_name, img));
+    }
+
+    for &ds_opt in downsamples {
+        let ds_val = ds_opt.unwrap_or(1);
+
+        for (bg_rs, bg_py) in bg_modes {
+            for (sig_rs, sig_py) in sigma_modes {
+                let mut total_rust_time = Duration::ZERO;
+                let mut centroids_found = 0;
+
+                for (_img_name, base_img) in &base_images {
+                    let (w, h) = base_img.dimensions();
+                    let new_w = w - (w % ds_val as u32);
+                    let new_h = h - (h % ds_val as u32);
+
+                    let mut rust_input_img = Array2::<u8>::zeros((new_h as usize, new_w as usize));
+                    let luma_img = base_img.to_luma8();
+
+                    for y in 0..new_h {
+                        for x in 0..new_w {
+                            rust_input_img[[y as usize, x as usize]] = luma_img.get_pixel(x, y)[0];
+                        }
+                    }
+
+                    let mut extractor = Extractor::new();
+                    let options = ExtractOptions {
+                        bg_sub_mode: *bg_rs,
+                        sigma_mode: *sig_rs,
+                        downsample: ds_opt,
+                        return_images: false,
+                        ..Default::default()
+                    };
+
+                    let start_rust = Instant::now();
+                    let rust_result = extractor.extract_u8(&rust_input_img, options);
+                    total_rust_time += start_rust.elapsed();
+                    centroids_found += rust_result.centroids.len();
+                }
+
+                println!(
+                    "  -> Total Rust u8 Extraction Time [bg: {}, sig: {}, ds: {:?}] ({} images, {} centroids): {:.2?}",
+                    bg_py,
+                    sig_py,
+                    ds_opt,
+                    base_images.len(),
+                    centroids_found,
+                    total_rust_time
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_extraction_u8_sanity() {
+    let bg_modes = [(Some(tetra3::extractor::BgSubMode::LocalMean), "local_mean")];
+    let sigma_modes = [(
+        tetra3::extractor::SigmaMode::GlobalRootSquare,
+        "global_root_square",
+    )];
+    let downsamples = [None];
+
+    run_validation_suite_u8(&bg_modes, &sigma_modes, &downsamples);
+}
+
+#[test]
+fn test_extraction_u8_full() {
+    let bg_modes = [
+        (
+            Some(tetra3::extractor::BgSubMode::LocalMedian),
+            "local_median",
+        ),
+        (Some(tetra3::extractor::BgSubMode::LocalMean), "local_mean"),
+        (
+            Some(tetra3::extractor::BgSubMode::GlobalMedian),
+            "global_median",
+        ),
+        (
+            Some(tetra3::extractor::BgSubMode::GlobalMean),
+            "global_mean",
+        ),
+        (None, "None"),
+    ];
+
+    let sigma_modes = [
+        (
+            tetra3::extractor::SigmaMode::LocalMedianAbs,
+            "local_median_abs",
+        ),
+        (
+            tetra3::extractor::SigmaMode::LocalRootSquare,
+            "local_root_square",
+        ),
+        (
+            tetra3::extractor::SigmaMode::GlobalMedianAbs,
+            "global_median_abs",
+        ),
+        (
+            tetra3::extractor::SigmaMode::GlobalRootSquare,
+            "global_root_square",
+        ),
+    ];
+
+    let downsamples = [None, Some(2), Some(4)];
+
+    run_validation_suite_u8(&bg_modes, &sigma_modes, &downsamples);
+}
+
 #[test]
 #[ignore]
 // Run intentionally via: cargo test generate_python_test_fixtures --release -- --ignored --nocapture
@@ -537,7 +657,7 @@ fn generate_python_test_fixtures() {
 
     // Create the directory where the zip files will be stored
     let fixtures_dir = Path::new("tests/fixtures");
-    std::fs::create_dir_all(&fixtures_dir).unwrap();
+    std::fs::create_dir_all(fixtures_dir).unwrap();
 
     // Ensure the freethreaded runtime is properly initialized before attaching
     Python::initialize();
@@ -555,7 +675,7 @@ fn generate_python_test_fixtures() {
             let mut loaded_rust_images = Vec::new();
             for path in &image_paths {
                 let img_name = path.file_name().unwrap().to_string_lossy().to_string();
-                let base_img = image::open(&path).unwrap();
+                let base_img = image::open(path).unwrap();
                 let (w, h) = base_img.dimensions();
                 let new_w = w - (w % ds_val as u32);
                 let new_h = h - (h % ds_val as u32);
@@ -661,6 +781,7 @@ fn generate_python_test_fixtures() {
 // This test requires the tetra3 module to be loaded in the Python environment
 fn test_performance_vs_python() {
     let mut total_rust_time = Duration::ZERO;
+    let mut total_rust_u8_time = Duration::ZERO;
     let mut total_py_time = Duration::ZERO;
     let iterations = 10;
     let image_paths = get_test_images();
@@ -688,17 +809,20 @@ fn test_performance_vs_python() {
         // Preload images to ensure disk I/O and numpy construction isn't counted in benchmarking loops
         let mut preloaded_images = Vec::new();
         for path in &image_paths {
-            let base_img = image::open(&path).unwrap();
+            let base_img = image::open(path).unwrap();
             let (w, h) = base_img.dimensions();
             let new_w = w - (w % ds_val as u32);
             let new_h = h - (h % ds_val as u32);
 
             let mut rust_input_img = Array2::<f32>::zeros((new_h as usize, new_w as usize));
+            let mut rust_input_img_u8 = Array2::<u8>::zeros((new_h as usize, new_w as usize));
             let luma_img = base_img.to_luma8();
 
             for y in 0..new_h {
                 for x in 0..new_w {
-                    rust_input_img[[y as usize, x as usize]] = luma_img.get_pixel(x, y)[0] as f32;
+                    let p_val = luma_img.get_pixel(x, y)[0];
+                    rust_input_img[[y as usize, x as usize]] = p_val as f32;
+                    rust_input_img_u8[[y as usize, x as usize]] = p_val;
                 }
             }
 
@@ -709,7 +833,7 @@ fn test_performance_vs_python() {
                     .reshape([new_h as usize, new_w as usize])
                     .unwrap();
 
-            preloaded_images.push((py_image_array, rust_input_img));
+            preloaded_images.push((py_image_array, rust_input_img, rust_input_img_u8));
         }
 
         println!(
@@ -718,7 +842,7 @@ fn test_performance_vs_python() {
         );
 
         for _ in 0..iterations {
-            for (py_image_array, rust_input_img) in &preloaded_images {
+            for (py_image_array, rust_input_img, rust_input_img_u8) in &preloaded_images {
                 // Run Python Algorithm
                 let start_py = Instant::now();
                 let _py_result = run_py_extraction_perf
@@ -730,6 +854,11 @@ fn test_performance_vs_python() {
                 let start_rust = Instant::now();
                 let _rust_result = tetra_extractor.extract(rust_input_img, options.clone());
                 total_rust_time += start_rust.elapsed();
+
+                let start_rust_u8 = Instant::now();
+                let _rust_result_u8 =
+                    tetra_extractor.extract_u8(rust_input_img_u8, options.clone());
+                total_rust_u8_time += start_rust_u8.elapsed();
             }
         }
     });
@@ -753,11 +882,19 @@ fn test_performance_vs_python() {
         );
     }
     println!("----------------------------------------------");
-    println!("Rust (Port) Total Time     : {:.2?}", total_rust_time);
+    println!("Rust (Port f32) Total Time : {:.2?}", total_rust_time);
     if image_count > 0 {
         println!(
-            "Rust (Port) Avg/Image      : {:.2?}",
+            "Rust (Port f32) Avg/Image  : {:.2?}",
             total_rust_time / image_count as u32
+        );
+    }
+    println!("----------------------------------------------");
+    println!("Rust (Port u8) Total Time  : {:.2?}", total_rust_u8_time);
+    if image_count > 0 {
+        println!(
+            "Rust (Port u8) Avg/Image   : {:.2?}",
+            total_rust_u8_time / image_count as u32
         );
     }
     println!("----------------------------------------------");
@@ -776,6 +913,7 @@ fn test_performance_vs_cedar() {
 
     for &ds_opt in &downsamples {
         let mut total_rust_time = Duration::ZERO;
+        let mut total_rust_u8_time = Duration::ZERO;
         let mut total_cedar_time = Duration::ZERO;
 
         let ds_val = ds_opt.unwrap_or(1);
@@ -791,12 +929,13 @@ fn test_performance_vs_cedar() {
         // Use the exact same loaded array for both algorithms to benchmark effectively
         let mut preloaded_images = Vec::new();
         for path in &image_paths {
-            let base_img = image::open(&path).unwrap();
+            let base_img = image::open(path).unwrap();
             let (w, h) = base_img.dimensions();
             let new_w = w - (w % ds_val as u32);
             let new_h = h - (h % ds_val as u32);
 
             let mut rust_input_img = Array2::<f32>::zeros((new_h as usize, new_w as usize));
+            let mut rust_input_img_u8 = Array2::<u8>::zeros((new_h as usize, new_w as usize));
             let mut cedar_img = image::GrayImage::new(new_w, new_h);
             let luma_img = base_img.to_luma8();
 
@@ -804,10 +943,11 @@ fn test_performance_vs_cedar() {
                 for x in 0..new_w {
                     let p_val = luma_img.get_pixel(x, y)[0];
                     rust_input_img[[y as usize, x as usize]] = p_val as f32;
+                    rust_input_img_u8[[y as usize, x as usize]] = p_val;
                     cedar_img.put_pixel(x, y, image::Luma([p_val]));
                 }
             }
-            preloaded_images.push((rust_input_img, cedar_img));
+            preloaded_images.push((rust_input_img, rust_input_img_u8, cedar_img));
         }
 
         println!(
@@ -816,11 +956,16 @@ fn test_performance_vs_cedar() {
         );
 
         for _ in 0..iterations {
-            for (rust_input_img, cedar_img) in &preloaded_images {
+            for (rust_input_img, rust_input_img_u8, cedar_img) in &preloaded_images {
                 // Run Rust Algorithm (Tetra3 Port)
                 let start_rust = Instant::now();
                 let _rust_result = tetra_extractor.extract(rust_input_img, options.clone());
                 total_rust_time += start_rust.elapsed();
+
+                let start_rust_u8 = Instant::now();
+                let _rust_result_u8 =
+                    tetra_extractor.extract_u8(rust_input_img_u8, options.clone());
+                total_rust_u8_time += start_rust_u8.elapsed();
 
                 // Run Cedar Detect Algorithm
                 let start_cedar = Instant::now();
@@ -852,11 +997,19 @@ fn test_performance_vs_cedar() {
             iterations
         );
         println!("----------------------------------------------");
-        println!("Rust (Port) Total Time     : {:.2?}", total_rust_time);
+        println!("Rust (Port f32) Total Time : {:.2?}", total_rust_time);
         if image_count > 0 {
             println!(
-                "Rust (Port) Avg/Image      : {:.2?}",
+                "Rust (Port f32) Avg/Image  : {:.2?}",
                 total_rust_time / image_count as u32
+            );
+        }
+        println!("----------------------------------------------");
+        println!("Rust (Port u8) Total Time  : {:.2?}", total_rust_u8_time);
+        if image_count > 0 {
+            println!(
+                "Rust (Port u8) Avg/Image   : {:.2?}",
+                total_rust_u8_time / image_count as u32
             );
         }
         println!("----------------------------------------------");
@@ -872,4 +1025,151 @@ fn test_performance_vs_cedar() {
         println!("Port Speedup vs Cedar      : {:.2}x", speedup);
         println!("==============================================\n");
     }
+}
+
+#[test]
+#[ignore]
+fn test_grayscale_vs_cedar() {
+    let db_path = Path::new("tests/fixtures/default_database.npz");
+    if !db_path.exists() {
+        eprintln!("Skipping test: default_database.npz not found.");
+        return;
+    }
+    let mut solver = Solver::load_database(db_path).expect("Failed to load Tetra3 database");
+
+    let image_paths = get_test_images();
+    let mut tetra_extractor = Extractor::new();
+    let options = ExtractOptions {
+        downsample: None,
+        return_images: false,
+        ..Default::default()
+    };
+
+    println!(
+        "
+{:<40} | {:<10} | {:<10} | {:<10} | {:<10} | {:<25} | {:<25}",
+        "Image", "Olive u8", "Olive f32", "Cedar", "Top 4 Match", "u8 Solved", "Cedar Solved"
+    );
+    println!("{}", "-".repeat(150));
+
+    for path in &image_paths {
+        let img_name = path.file_name().unwrap().to_string_lossy().to_string();
+        let base_img = image::open(path).unwrap();
+        let luma_img = base_img.to_luma8();
+        let (w, h) = luma_img.dimensions();
+
+        let mut rust_input_img_u8 = Array2::<u8>::zeros((h as usize, w as usize));
+        let mut rust_input_img_f32 = Array2::<f32>::zeros((h as usize, w as usize));
+        for y in 0..h {
+            for x in 0..w {
+                let p = luma_img.get_pixel(x, y)[0];
+                rust_input_img_u8[[y as usize, x as usize]] = p;
+                rust_input_img_f32[[y as usize, x as usize]] = p as f32;
+            }
+        }
+
+        // Run Olive u8
+        let olive_u8_result = tetra_extractor.extract_u8(&rust_input_img_u8, options.clone());
+        let olive_u8_count = olive_u8_result.centroids.len();
+
+        // Run Olive f32
+        let olive_f32_result = tetra_extractor.extract(&rust_input_img_f32, options.clone());
+        let olive_f32_count = olive_f32_result.centroids.len();
+
+        // Run Cedar Detect
+        let noise_estimate = estimate_noise_from_image(&luma_img);
+        let cedar_result = get_stars_from_image(
+            &luma_img,
+            noise_estimate,
+            8.0,
+            false,
+            1, // ds
+            true,
+            false,
+        );
+        let cedar_count = cedar_result.0.len();
+
+        // Solve Olive u8
+        let mut u8_cents_flat = Vec::with_capacity(olive_u8_count * 2);
+        for c in &olive_u8_result.centroids {
+            u8_cents_flat.push(c.y);
+            u8_cents_flat.push(c.x);
+        }
+        let u8_cents_arr = Array2::from_shape_vec((olive_u8_count, 2), u8_cents_flat).unwrap();
+        let u8_solve_res =
+            solver.solve(&u8_cents_arr, (h as f64, w as f64), SolveOptions::default());
+        let u8_solve_str = if u8_solve_res.status == SolveStatus::MatchFound {
+            format!(
+                "{:.3}, {:.3}, {:.3}",
+                u8_solve_res.ra.unwrap(),
+                u8_solve_res.dec.unwrap(),
+                u8_solve_res.roll.unwrap()
+            )
+        } else {
+            "None".to_string()
+        };
+
+        // Solve Cedar
+        let mut cedar_cents_flat = Vec::with_capacity(cedar_count * 2);
+        for c in &cedar_result.0 {
+            cedar_cents_flat.push(c.centroid_y as f64);
+            cedar_cents_flat.push(c.centroid_x as f64);
+        }
+        let cedar_cents_arr = Array2::from_shape_vec((cedar_count, 2), cedar_cents_flat).unwrap();
+        let cedar_solve_res = solver.solve(
+            &cedar_cents_arr,
+            (h as f64, w as f64),
+            SolveOptions::default(),
+        );
+        let cedar_solve_str = if cedar_solve_res.status == SolveStatus::MatchFound {
+            format!(
+                "{:.3}, {:.3}, {:.3}",
+                cedar_solve_res.ra.unwrap(),
+                cedar_solve_res.dec.unwrap(),
+                cedar_solve_res.roll.unwrap()
+            )
+        } else {
+            "None".to_string()
+        };
+
+        // Compare top 4 (Olive u8 vs Cedar)
+        let mut match_top4 = true;
+        let eps = 2.0; // Distance tolerance
+
+        let compare_len = 4.min(olive_u8_count).min(cedar_count);
+        if (olive_u8_count < 4 || cedar_count < 4) && olive_u8_count != cedar_count {
+            match_top4 = false;
+        }
+
+        for i in 0..compare_len {
+            let p = &olive_u8_result.centroids[i];
+            let c = &cedar_result.0[i];
+
+            let dist =
+                ((p.x - c.centroid_x as f64).powi(2) + (p.y - c.centroid_y as f64).powi(2)).sqrt();
+            if dist > eps {
+                match_top4 = false;
+                break;
+            }
+        }
+
+        let match_str = if match_top4 && compare_len > 0 {
+            "YES"
+        } else if compare_len == 0 && olive_u8_count == cedar_count {
+            "YES (0)"
+        } else {
+            "NO"
+        };
+        println!(
+            "{:<40} | {:<10} | {:<10} | {:<10} | {:<10} | {:<25} | {:<25}",
+            img_name,
+            olive_u8_count,
+            olive_f32_count,
+            cedar_count,
+            match_str,
+            u8_solve_str,
+            cedar_solve_str
+        );
+    }
+    println!();
 }
