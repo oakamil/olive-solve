@@ -203,6 +203,7 @@ fn fast_box_blur_2d<T: Copy + ToF32 + Sync + Send>(
     let rad = size / 2;
     let area = (size * size) as f32;
 
+    // Horizontal pass: standard sliding sum (cache friendly)
     scratch
         .par_chunks_exact_mut(w)
         .zip(src.par_chunks_exact(w))
@@ -218,7 +219,7 @@ fn fast_box_blur_2d<T: Copy + ToF32 + Sync + Send>(
                     }
                     for x in 1..=rad {
                         sum += i_row.get_unchecked(x - 1).to_f32();
-                    }
+                    } // Reflection
                     *s_row.get_unchecked_mut(0) = sum;
 
                     for x in 1..=rad {
@@ -227,6 +228,7 @@ fn fast_box_blur_2d<T: Copy + ToF32 + Sync + Send>(
                         *s_row.get_unchecked_mut(x) = sum;
                     }
                     for x in (rad + 1)..(w - rad) {
+                        // Branchless inner core
                         sum += i_row.get_unchecked(x + rad).to_f32()
                             - i_row.get_unchecked(x - rad - 1).to_f32();
                         *s_row.get_unchecked_mut(x) = sum;
@@ -274,6 +276,8 @@ fn fast_box_blur_2d<T: Copy + ToF32 + Sync + Send>(
             }
         });
 
+    // Vertical pass
+    // Parallel over column strips for cache locality
     let strip_width = 128;
     let num_strips = (w + strip_width - 1) / strip_width;
     let out_ptr = out.as_mut_ptr() as usize;
@@ -338,7 +342,7 @@ fn fast_box_blur_2d<T: Copy + ToF32 + Sync + Send>(
     });
 }
 
-/// Specialized integer blur: Reads u8, scratches to u16 (50% less bandwidth), outputs scaled 
+/// Specialized integer blur: Reads u8, scratches to u16 (50% less bandwidth), outputs scaled
 /// subtracted i16 image. Preserves 7 bits of sub-pixel fractional precision by scaling subtracted
 /// values by 128.0 and applying proper float rounding before cast.
 fn fast_box_blur_2d_u8_to_i16_scaled(
@@ -354,6 +358,7 @@ fn fast_box_blur_2d_u8_to_i16_scaled(
     let inv_area = 1.0 / (size * size) as f32;
 
     // Horizontal pass: u8 -> u16
+    // Standard sliding sum (cache friendly)
     scratch
         .par_chunks_exact_mut(w)
         .zip(src.par_chunks_exact(w))
@@ -366,7 +371,7 @@ fn fast_box_blur_2d_u8_to_i16_scaled(
                     }
                     for x in 1..=rad {
                         sum += *i_row.get_unchecked(x - 1) as u16;
-                    }
+                    } // Reflection
                     *s_row.get_unchecked_mut(0) = sum;
 
                     for x in 1..=rad {
@@ -375,6 +380,7 @@ fn fast_box_blur_2d_u8_to_i16_scaled(
                         *s_row.get_unchecked_mut(x) = sum;
                     }
                     for x in (rad + 1)..(w - rad) {
+                        // Branchless inner core
                         sum = sum + (*i_row.get_unchecked(x + rad) as u16)
                             - (*i_row.get_unchecked(x - rad - 1) as u16);
                         *s_row.get_unchecked_mut(x) = sum;
@@ -422,12 +428,13 @@ fn fast_box_blur_2d_u8_to_i16_scaled(
             }
         });
 
+    // Vertical pass: Reads u16 -> Math in f32 -> Scales by 128x to preserve sub-pixel accuracy ->
+    // Writes fused i16
+    // Parallel over column strips for cache locality
     let strip_width = 128;
     let num_strips = (w + strip_width - 1) / strip_width;
     let out_ptr = out.as_mut_ptr() as usize;
 
-    // Vertical pass: Reads u16 -> Math in f32 -> Scales by 128x to preserve sub-pixel accuracy ->
-    // Writes fused i16
     (0..num_strips)
         .into_par_iter()
         .map(|strip_idx| {
@@ -517,6 +524,7 @@ fn fast_box_blur_2d_u8_to_f32_subtracted(
     let inv_area = 1.0 / (size * size) as f32;
 
     // Horizontal pass: u8 -> u16 (Slashes memory write bandwidth by 50% vs standard f32)
+    // Standard sliding sum (cache friendly)
     scratch
         .par_chunks_exact_mut(w)
         .zip(src.par_chunks_exact(w))
@@ -529,7 +537,7 @@ fn fast_box_blur_2d_u8_to_f32_subtracted(
                     }
                     for x in 1..=rad {
                         sum += *i_row.get_unchecked(x - 1) as u16;
-                    }
+                    } // Reflection
                     *s_row.get_unchecked_mut(0) = sum;
 
                     for x in 1..=rad {
@@ -538,6 +546,7 @@ fn fast_box_blur_2d_u8_to_f32_subtracted(
                         *s_row.get_unchecked_mut(x) = sum;
                     }
                     for x in (rad + 1)..(w - rad) {
+                        // Branchless inner core
                         sum = sum + (*i_row.get_unchecked(x + rad) as u16)
                             - (*i_row.get_unchecked(x - rad - 1) as u16);
                         *s_row.get_unchecked_mut(x) = sum;
@@ -585,12 +594,13 @@ fn fast_box_blur_2d_u8_to_f32_subtracted(
             }
         });
 
+    // Vertical pass: Reads u16 -> Math in f32 -> Writes f32 subtracted image directly to
+    // out_buffer.
+    // Parallel over column strips for cache locality
     let strip_width = 128;
     let num_strips = (w + strip_width - 1) / strip_width;
     let out_ptr = out.as_mut_ptr() as usize;
 
-    // Vertical pass: Reads u16 -> Math in f32 -> Writes f32 subtracted image directly to
-    // out_buffer.
     (0..num_strips)
         .into_par_iter()
         .map(|strip_idx| {
@@ -825,20 +835,20 @@ impl Extractor {
                                 sum += cropped[[y * ds + dy, x * ds + dx]];
                             }
                         }
+                        // Hardcoded `sum_when_downsample = true` (mathematically identical to Python
+                        // wrapper)
                         row[x] = sum;
                     }
                 });
         } else {
-            self.image_vec.resize(height * width, 0.0);
+            // Memory pptimization - eliminate unnecessary zeroing memset
+            self.image_vec.clear();
             if let Some(s) = cropped.as_slice() {
-                self.image_vec.copy_from_slice(s);
+                self.image_vec.extend_from_slice(s);
             } else {
-                for (out_row, in_row) in self
-                    .image_vec
-                    .chunks_exact_mut(width)
-                    .zip(cropped.axis_iter(ndarray::Axis(0)))
-                {
-                    out_row.copy_from_slice(in_row.as_slice().unwrap());
+                self.image_vec.reserve(height * width);
+                for row in cropped.rows() {
+                    self.image_vec.extend(row.iter().copied());
                 }
             }
         }
@@ -993,7 +1003,7 @@ impl Extractor {
             self.extract_f32_pipeline(out_width, out_height, final_offs_w, final_offs_h, options)
         } else {
             // Fast promotion path (1x mode)
-            // Route to standard float pipeline for local sigmas/medians that are too complex to 
+            // Route to standard float pipeline for local sigmas/medians that are too complex to
             // fuse
             if matches!(
                 options.sigma_mode,
@@ -1175,6 +1185,7 @@ impl Extractor {
         };
 
         // 2. Subtract background directly into i16 buffer
+        // Fused background subtraction + RMS calculation (Evaluated as an expression)
         self.image_i16.resize(width * height, 0);
         let sum_sq_global: f64 = if let Some(mode) = options.bg_sub_mode {
             match mode {
@@ -1263,6 +1274,7 @@ impl Extractor {
         };
 
         // 4. Threshold to find binary mask
+        // Fused fast extraction: evaluates threshold + binary erosion (3x3 cross) in a single pass.
         let chunk_size = (height / rayon::current_num_threads()).max(64);
 
         let eroded_pixels: Vec<usize> = if options.binary_open {
@@ -1331,6 +1343,7 @@ impl Extractor {
         };
 
         // Binary dilation
+        // Instant dilation matrix mapped linearly via fast index marking
         self.mask.resize(width * height, false);
         self.mask.fill(false);
 
@@ -1363,6 +1376,7 @@ impl Extractor {
         let mut extracted = Vec::new();
 
         // 5. Label regions & 6. Accumulate statistics
+        // Helper: 4-connected components labeling & centered moments executed in a single pass
         for &seed in &eroded_pixels {
             if !self.mask[seed] {
                 continue;
@@ -1377,6 +1391,7 @@ impl Extractor {
             let sx = (seed % width) as f64;
             let sy = (seed / width) as f64;
 
+            // Apply parallel axis theorem to accumulate variances in single loop
             let mut sum_x = sx * val;
             let mut sum_y = sy * val;
             let mut sum_xx = sx * sx * val;
@@ -1560,6 +1575,7 @@ impl Extractor {
         };
 
         // 2. Subtract background directly into the native f32 buffer
+        // Fused background subtraction + RMS calculation (Evaluated as an expression)
         self.image_vec.resize(width * height, 0.0);
 
         let sum_sq_global: f64 = if let Some(mode) = options.bg_sub_mode {
@@ -1655,6 +1671,7 @@ impl Extractor {
         };
 
         // 4. Threshold to find binary mask
+        // Fused fast extraction: evaluates threshold + binary erosion (3x3 cross) in a single pass.
         // Note: Because self.image_vec contains the same floats as the standard pipeline, this
         // loop is bit-for-bit identical to the original logic, guaranteeing matching centroid
         // output.
@@ -1724,6 +1741,7 @@ impl Extractor {
         };
 
         // Binary dilation
+        // Instant dilation matrix mapped linearly via fast index marking
         self.mask.resize(width * height, false);
         self.mask.fill(false);
 
@@ -1949,6 +1967,7 @@ impl Extractor {
         };
 
         // 2. Subtract background
+        // Fused background subtraction + RMS calculation (Evaluated as an expression)
         let sum_sq_global: f64 = if let Some(mode) = options.bg_sub_mode {
             match mode {
                 BgSubMode::LocalMean => {
@@ -2236,6 +2255,7 @@ impl Extractor {
         };
 
         // 4. Threshold to find binary mask
+        // Fused fast extraction: evaluates threshold + binary erosion (3x3 cross) in a single pass.
         let chunk_size = (height / rayon::current_num_threads()).max(64);
 
         let eroded_pixels: Vec<usize> = match threshold {
@@ -2252,6 +2272,9 @@ impl Extractor {
                                 for y in start_y..end_y {
                                     let row_offset = y * width;
 
+                                    // Optimization: extracting exact row slices and using raw
+                                    // pointers entirely strips vector bounds checks from the
+                                    // inner `x` loop.
                                     let p_prev =
                                         self.image_vec[(y - 1) * width..y * width].as_ptr();
                                     let p_curr =
@@ -2321,6 +2344,9 @@ impl Extractor {
                                 for y in start_y..end_y {
                                     let row_offset = y * width;
 
+                                    // Optimization: Extracting exact row slices and using raw
+                                    // pointers entirely strips vector bounds checks from the 
+                                    // inner `x` loop.
                                     let p_prev =
                                         self.image_vec[(y - 1) * width..y * width].as_ptr();
                                     let p_curr =
@@ -2385,6 +2411,7 @@ impl Extractor {
         };
 
         // Binary dilation
+        // Instant dilation matrix mapped linearly via fast index marking
         self.mask.resize(width * height, false);
         self.mask.fill(false);
 
