@@ -338,8 +338,9 @@ fn fast_box_blur_2d<T: Copy + ToF32 + Sync + Send>(
     });
 }
 
-/// Specialized integer blur: Reads u8, scratches to u16 (50% less bandwidth), outputs scaled subtracted i16 image.
-/// Preserves 7 bits of sub-pixel fractional precision by scaling subtracted values by 128.0 and applying proper float rounding before cast.
+/// Specialized integer blur: Reads u8, scratches to u16 (50% less bandwidth), outputs scaled 
+/// subtracted i16 image. Preserves 7 bits of sub-pixel fractional precision by scaling subtracted
+/// values by 128.0 and applying proper float rounding before cast.
 fn fast_box_blur_2d_u8_to_i16_scaled(
     src: &[u8],
     scratch: &mut [u16],
@@ -425,7 +426,8 @@ fn fast_box_blur_2d_u8_to_i16_scaled(
     let num_strips = (w + strip_width - 1) / strip_width;
     let out_ptr = out.as_mut_ptr() as usize;
 
-    // Vertical pass: Reads u16 -> Math in f32 -> Scales by 128x to preserve sub-pixel accuracy -> Writes fused i16
+    // Vertical pass: Reads u16 -> Math in f32 -> Scales by 128x to preserve sub-pixel accuracy ->
+    // Writes fused i16
     (0..num_strips)
         .into_par_iter()
         .map(|strip_idx| {
@@ -458,7 +460,7 @@ fn fast_box_blur_2d_u8_to_i16_scaled(
                     let bg = (col_sums[x] as f32) * inv_area;
                     let val_f32 = (src_row[x] as f32) - bg;
                     // `.round()` better quantizes the value instead of truncating towards zero.
-                    // This better preserves fractional sub-pixel intensity for the centroid solver.
+                    // Better preserves fractional sub-pixel intensity for the centroid solver.
                     *o = (val_f32 * 128.0).round() as i16;
                     thread_sq_sum += (val_f32 as f64) * (val_f32 as f64);
                 }
@@ -499,8 +501,9 @@ fn fast_box_blur_2d_u8_to_i16_scaled(
         .sum()
 }
 
-/// Fused fast blur: Reads u8, scratches to u16 (saving memory bandwidth), outputs f32 subtracted image.
-/// This removes memory copying overhead of the standard pipeline while preserving mathematical bit-for-bit identity.
+/// Fused fast blur: Reads u8, scratches to u16 (saving memory bandwidth), outputs f32 subtracted
+/// image.Removes memory copying overhead of the standard pipeline while preserving mathematical
+/// bit-for-bit identity.
 fn fast_box_blur_2d_u8_to_f32_subtracted(
     src: &[u8],
     scratch: &mut [u16],
@@ -586,7 +589,8 @@ fn fast_box_blur_2d_u8_to_f32_subtracted(
     let num_strips = (w + strip_width - 1) / strip_width;
     let out_ptr = out.as_mut_ptr() as usize;
 
-    // Vertical pass: Reads u16 -> Math in f32 -> Writes f32 subtracted image directly to out_buffer.
+    // Vertical pass: Reads u16 -> Math in f32 -> Writes f32 subtracted image directly to
+    // out_buffer.
     (0..num_strips)
         .into_par_iter()
         .map(|strip_idx| {
@@ -843,7 +847,8 @@ impl Extractor {
         self.extract_f32_pipeline(width, height, final_offs_w, final_offs_h, options)
     }
 
-    /// Standard u8 pipeline: Handles downsampling internally. Utilizes f32 pipeline for 1x resolution. Removes image_vec copy overhead while identically matching f32 math accuracy.
+    /// Standard u8 pipeline: Handles downsampling internally. Utilizes f32 pipeline for 1x
+    /// resolution. Removes image_vec copy overhead while identically matching f32 math accuracy.
     pub fn extract_u8<S>(
         &mut self,
         input_image: &ArrayBase<S, Ix2>,
@@ -903,7 +908,7 @@ impl Extractor {
 
             if let Some(s) = cropped.as_slice() {
                 // Manually unrolled 2x and 4x paths.
-                // Removes inner variable loops, allowing the compiler to use direct SIMD load-adds.
+                // Removes inner variable loops allowing the compiler to use direct SIMD load-adds.
                 let w = width;
                 if ds == 2 {
                     self.image_vec
@@ -988,7 +993,8 @@ impl Extractor {
             self.extract_f32_pipeline(out_width, out_height, final_offs_w, final_offs_h, options)
         } else {
             // Fast promotion path (1x mode)
-            // Route to standard float pipeline for local sigmas/medians that are too complex to fuse
+            // Route to standard float pipeline for local sigmas/medians that are too complex to 
+            // fuse
             if matches!(
                 options.sigma_mode,
                 SigmaMode::LocalMedianAbs | SigmaMode::LocalRootSquare
@@ -1191,7 +1197,8 @@ impl Extractor {
                         .zip(src.par_iter())
                         .map(|(o, &i)| {
                             let val_f32 = (i as f32) - mean;
-                            // .round() prevents truncation-towards-zero, preserving floating point statistics
+                            // .round() prevents truncation-towards-zero, preserving floating point
+                            // statistics
                             *o = (val_f32 * 128.0).round() as i16;
                             (val_f32 as f64) * (val_f32 as f64)
                         })
@@ -1275,7 +1282,8 @@ impl Extractor {
 
                             for x in 1..width - 1 {
                                 unsafe {
-                                    // The scalar `threshold` is already scaled by 128x allowing pure int branching
+                                    // The scalar `threshold` is already scaled by 128x allowing
+                                    // pure int branching
                                     if *p_curr.add(x) > threshold {
                                         if *p_curr.add(x - 1) > threshold
                                             && *p_curr.add(x + 1) > threshold
@@ -1532,8 +1540,8 @@ impl Extractor {
         }
     }
 
-    /// Fused f32 pipeline: Provides 100% exact bit-for-bit math identical to the standard f32 pipeline,
-    /// but slashes memory traffic by computing the subtraction on the fly.
+    /// Fused f32 pipeline: Provides 100% exact bit-for-bit math identical to the standard f32
+    /// pipeline, but slashes memory traffic by computing the subtraction on the fly.
     fn extract_fused_f32_pipeline(
         &mut self,
         src: &[u8],
@@ -1647,7 +1655,9 @@ impl Extractor {
         };
 
         // 4. Threshold to find binary mask
-        // Note: Because self.image_vec contains the same floats as the standard pipeline, this loop is bit-for-bit identical to the original logic, guaranteeing matching centroid output.
+        // Note: Because self.image_vec contains the same floats as the standard pipeline, this
+        // loop is bit-for-bit identical to the original logic, guaranteeing matching centroid
+        // output.
         let chunk_size = (height / rayon::current_num_threads()).max(64);
 
         let eroded_pixels: Vec<usize> = if options.binary_open {
@@ -1922,7 +1932,8 @@ impl Extractor {
         }
     }
 
-    /// Shared internal pipeline containing Steps 2-9 for standard f32 inputs or late-promotion formats.
+    /// Shared internal pipeline containing Steps 2-9 for standard f32 inputs or late-promotion
+    /// formats.
     fn extract_f32_pipeline(
         &mut self,
         width: usize,
