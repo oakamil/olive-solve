@@ -172,7 +172,7 @@ pub struct ExtractionResult {
 }
 
 /// Trait to allow our highly optimized spatial filters to transparently operate
-/// on either `u8` (Zero-copy ingestion) or `f32` (Standard/Downsampled modes)
+/// on either `u8` (zero-copy ingestion) or `f32` (standard/downsampled modes)
 pub trait ToF32 {
     fn to_f32(self) -> f32;
 }
@@ -191,7 +191,7 @@ impl ToF32 for u8 {
     }
 }
 
-/// Helper: 2D Uniform Filter (Box Blur) - Generic over Source Type
+/// Helper: 2D uniform filter (box blur) - generic over source type
 fn fast_box_blur_2d<T: Copy + ToF32 + Sync + Send>(
     src: &[T],
     scratch: &mut [f32],
@@ -338,7 +338,7 @@ fn fast_box_blur_2d<T: Copy + ToF32 + Sync + Send>(
     });
 }
 
-/// Specialized Integer Blur: Reads u8, scratches to u16 (50% less bandwidth), outputs Scaled Subtracted i16 image.
+/// Specialized integer blur: Reads u8, scratches to u16 (50% less bandwidth), outputs scaled subtracted i16 image.
 /// Preserves 7 bits of sub-pixel fractional precision by scaling subtracted values by 128.0 and applying proper float rounding before cast.
 fn fast_box_blur_2d_u8_to_i16_scaled(
     src: &[u8],
@@ -352,7 +352,7 @@ fn fast_box_blur_2d_u8_to_i16_scaled(
     let rad = size / 2;
     let inv_area = 1.0 / (size * size) as f32;
 
-    // Horizontal Pass: u8 -> u16
+    // Horizontal pass: u8 -> u16
     scratch
         .par_chunks_exact_mut(w)
         .zip(src.par_chunks_exact(w))
@@ -425,7 +425,7 @@ fn fast_box_blur_2d_u8_to_i16_scaled(
     let num_strips = (w + strip_width - 1) / strip_width;
     let out_ptr = out.as_mut_ptr() as usize;
 
-    // Vertical Pass: Reads u16 -> Math in f32 -> Scales by 128x to preserve sub-pixel accuracy -> Writes Fused i16
+    // Vertical pass: Reads u16 -> Math in f32 -> Scales by 128x to preserve sub-pixel accuracy -> Writes fused i16
     (0..num_strips)
         .into_par_iter()
         .map(|strip_idx| {
@@ -457,8 +457,8 @@ fn fast_box_blur_2d_u8_to_i16_scaled(
                 for (x, o) in out_row.iter_mut().enumerate() {
                     let bg = (col_sums[x] as f32) * inv_area;
                     let val_f32 = (src_row[x] as f32) - bg;
-                    // OPTIMIZATION: `.round()` properly quantizes the value instead of truncating towards zero.
-                    // This accurately preserves fractional sub-pixel intensity for the centroid solver.
+                    // `.round()` better quantizes the value instead of truncating towards zero.
+                    // This better preserves fractional sub-pixel intensity for the centroid solver.
                     *o = (val_f32 * 128.0).round() as i16;
                     thread_sq_sum += (val_f32 as f64) * (val_f32 as f64);
                 }
@@ -489,7 +489,7 @@ fn fast_box_blur_2d_u8_to_i16_scaled(
                     col_sums[x] = col_sums[x] + (add_row[x] as u32) - (sub_row[x] as u32);
                     let bg = (col_sums[x] as f32) * inv_area;
                     let val_f32 = (src_row[x] as f32) - bg;
-                    // OPTIMIZATION: `.round()` properly quantizes the value instead of truncating towards zero.
+                    // `.round()` better quantizes the value instead of truncating towards zero.
                     out_row[x] = (val_f32 * 128.0).round() as i16;
                     thread_sq_sum += (val_f32 as f64) * (val_f32 as f64);
                 }
@@ -499,8 +499,8 @@ fn fast_box_blur_2d_u8_to_i16_scaled(
         .sum()
 }
 
-/// Fused Fast Blur: Reads u8, scratches to u16 (saving memory bandwidth), outputs PERFECT F32 Subtracted image.
-/// This eradicates the 8MB memory copying overhead of the standard pipeline while preserving 100% mathematical bit-for-bit identity.
+/// Fused fast blur: Reads u8, scratches to u16 (saving memory bandwidth), outputs f32 subtracted image.
+/// This removes memory copying overhead of the standard pipeline while preserving mathematical bit-for-bit identity.
 fn fast_box_blur_2d_u8_to_f32_subtracted(
     src: &[u8],
     scratch: &mut [u16],
@@ -513,7 +513,7 @@ fn fast_box_blur_2d_u8_to_f32_subtracted(
     let rad = size / 2;
     let inv_area = 1.0 / (size * size) as f32;
 
-    // Horizontal Pass: u8 -> u16 (Slashes memory write bandwidth by 50% vs standard f32)
+    // Horizontal pass: u8 -> u16 (Slashes memory write bandwidth by 50% vs standard f32)
     scratch
         .par_chunks_exact_mut(w)
         .zip(src.par_chunks_exact(w))
@@ -586,7 +586,7 @@ fn fast_box_blur_2d_u8_to_f32_subtracted(
     let num_strips = (w + strip_width - 1) / strip_width;
     let out_ptr = out.as_mut_ptr() as usize;
 
-    // Vertical Pass: Reads u16 -> Math in f32 -> Writes exact F32 subtracted image directly to out_buffer.
+    // Vertical pass: Reads u16 -> Math in f32 -> Writes f32 subtracted image directly to out_buffer.
     (0..num_strips)
         .into_par_iter()
         .map(|strip_idx| {
@@ -657,7 +657,7 @@ fn fast_box_blur_2d_u8_to_f32_subtracted(
         .sum()
 }
 
-/// Helper: 2D Median Filter using raw slices - Generic over Source Type
+/// Helper: 2D median filter using raw slices - generic over source type
 fn fast_median_filter_2d<T: Copy + ToF32 + Sync + Send>(
     src: &[T],
     out: &mut [f32],
@@ -709,13 +709,13 @@ fn fast_median_filter_2d<T: Copy + ToF32 + Sync + Send>(
 /// Extractor maintains pre-allocated global buffers to eliminate OS memory allocations
 /// during continuous execution, fulfilling the zero-allocation performance pattern.
 pub struct Extractor {
-    // Primary buffers for the Standard f32 pipeline
+    // Primary buffers for the standard f32 pipeline
     image_vec: Vec<f32>,
     scratch: Vec<f32>,
     median_scratch: Vec<f32>,
     std_img: Vec<f32>,
 
-    // Fast Fused Pipeline optimizations
+    // Fast fused pipeline optimizations
     scratch_u16: Vec<u16>,
     median_scratch_u8: Vec<u8>,
     contiguous_u8: Vec<u8>,
@@ -753,7 +753,7 @@ impl Extractor {
         }
     }
 
-    /// Primary Extraction method for standard `f32` Floating-Point image inputs.
+    /// Primary extraction method for standard `f32` floating-point image inputs.
     pub fn extract<S>(
         &mut self,
         input_image: &ArrayBase<S, Ix2>,
@@ -839,12 +839,11 @@ impl Extractor {
             }
         }
 
-        // Handoff to shared Core execution pipeline
+        // Handoff to shared core execution pipeline
         self.extract_f32_pipeline(width, height, final_offs_w, final_offs_h, options)
     }
 
-    /// Standard u8 pipeline: Handles downsampling internally. Promoted to utilize the Fused F32 pipeline
-    /// for 1x resolution. This eradicates the 8MB image_vec copy overhead while identically matching f32 math accuracy.
+    /// Standard u8 pipeline: Handles downsampling internally. Utilizes f32 pipeline for 1x resolution. Removes image_vec copy overhead while identically matching f32 math accuracy.
     pub fn extract_u8<S>(
         &mut self,
         input_image: &ArrayBase<S, Ix2>,
@@ -896,15 +895,15 @@ impl Extractor {
         ]);
 
         if let Some(ds) = options.downsample {
-            // Late-Promotion Path (For downsampled sources)
+            // Late-promotion path (for downsampled sources)
             let out_height = height / ds;
             let out_width = width / ds;
 
             self.image_vec.resize(out_height * out_width, 0.0);
 
             if let Some(s) = cropped.as_slice() {
-                // OPTIMIZATION: Manually unrolled 2x and 4x paths.
-                // Eradicates inner variable loops, allowing the compiler to use direct SIMD load-adds.
+                // Manually unrolled 2x and 4x paths.
+                // Removes inner variable loops, allowing the compiler to use direct SIMD load-adds.
                 let w = width;
                 if ds == 2 {
                     self.image_vec
@@ -988,7 +987,7 @@ impl Extractor {
 
             self.extract_f32_pipeline(out_width, out_height, final_offs_w, final_offs_h, options)
         } else {
-            // Fast Promotion Path (1x Mode)
+            // Fast promotion path (1x mode)
             // Route to standard float pipeline for local sigmas/medians that are too complex to fuse
             if matches!(
                 options.sigma_mode,
@@ -1018,7 +1017,7 @@ impl Extractor {
                 }
                 self.extract_f32_pipeline(width, height, final_offs_w, final_offs_h, options)
             } else {
-                // Execute highly optimized fused F32 pipeline
+                // Execute highly optimized fused f32 pipeline
                 if let Some(s) = cropped.as_slice() {
                     self.extract_fused_f32_pipeline(
                         s,
@@ -1052,8 +1051,9 @@ impl Extractor {
         }
     }
 
-    /// Blazing fast 1x pipeline utilizing Fixed-Point Math inside CPU integer registers.
-    /// Scaled by 128.0 and Rounded to uniquely preserve fractional sub-pixel intensity at maximum speed.
+    /// Fast 1x pipeline utilizing fixed-point math inside CPU integer registers.
+    /// Scaled by 128.0 and rounded to preserve fractional sub-pixel intensity at maximum speed.
+    /// Small tradeoff in accuracy for better performance.
     pub fn extract_u8_fast<S>(
         &mut self,
         input_image: &ArrayBase<S, Ix2>,
@@ -1116,7 +1116,7 @@ impl Extractor {
             final_offs_w..final_offs_w + width
         ]);
 
-        // 1x Integer Pipeline (Half Memory Bandwidth Route via i16)
+        // 1x Integer pipeline (half memory bandwidth route via i16)
         if let Some(s) = cropped.as_slice() {
             // If memory is already contiguous, pass the slice directly
             self.extract_i16_pipeline(s, width, height, final_offs_w, final_offs_h, options)
@@ -1149,7 +1149,7 @@ impl Extractor {
         }
     }
 
-    /// Dedicated Fixed-Point Pipeline: Halves memory bandwidth using `i16` arrays while seamlessly
+    /// Dedicated fixed-point pipeline: Halves memory bandwidth using `i16` arrays while
     /// scaling subtracted intensities by `128x` to preserve 7 bits of `f32` sub-pixel precision.
     fn extract_i16_pipeline(
         &mut self,
@@ -1191,7 +1191,7 @@ impl Extractor {
                         .zip(src.par_iter())
                         .map(|(o, &i)| {
                             let val_f32 = (i as f32) - mean;
-                            // OPTIMIZATION: .round() prevents truncation-towards-zero, perfectly preserving floating point statistics
+                            // .round() prevents truncation-towards-zero, preserving floating point statistics
                             *o = (val_f32 * 128.0).round() as i16;
                             (val_f32 as f64) * (val_f32 as f64)
                         })
@@ -1238,26 +1238,17 @@ impl Extractor {
         };
 
         // 3. Find noise standard deviation to threshold
-        enum Threshold<'a> {
-            Scalar(i16),
-            Array(&'a [i16]),
-        }
-
-        let threshold = if let Some(th) = options.image_th {
-            Threshold::Scalar((th * 128.0).round() as i16)
+        let threshold: i16 = if let Some(th) = options.image_th {
+            (th * 128.0).round() as i16
         } else {
             match options.sigma_mode {
                 SigmaMode::GlobalRootSquare => {
                     let mean_sq = (sum_sq_global / (height * width) as f64) as f32;
-                    Threshold::Scalar(
-                        (mean_sq.max(0.0).sqrt() * options.sigma * 128.0).round() as i16
-                    )
+                    (mean_sq.max(0.0).sqrt() * options.sigma * 128.0).round() as i16
                 }
-                SigmaMode::GlobalMedianAbs => {
-                    // Fallback handled smoothly at entry block
-                    unreachable!()
-                }
-                SigmaMode::LocalMedianAbs | SigmaMode::LocalRootSquare => {
+                SigmaMode::GlobalMedianAbs
+                | SigmaMode::LocalMedianAbs
+                | SigmaMode::LocalRootSquare => {
                     // Fallback handled smoothly at entry block
                     unreachable!()
                 }
@@ -1267,150 +1258,71 @@ impl Extractor {
         // 4. Threshold to find binary mask
         let chunk_size = (height / rayon::current_num_threads()).max(64);
 
-        let eroded_pixels: Vec<usize> = match threshold {
-            Threshold::Scalar(th) => {
-                if options.binary_open {
-                    let chunks = height.saturating_sub(2).div_ceil(chunk_size);
-                    (0..chunks)
-                        .into_par_iter()
-                        .fold(
-                            || Vec::with_capacity(128),
-                            |mut acc, chunk_idx| {
-                                let start_y = 1 + chunk_idx * chunk_size;
-                                let end_y = (start_y + chunk_size).min(height - 1);
-                                for y in start_y..end_y {
-                                    let row_offset = y * width;
-                                    let p_prev =
-                                        self.image_i16[(y - 1) * width..y * width].as_ptr();
-                                    let p_curr =
-                                        self.image_i16[y * width..(y + 1) * width].as_ptr();
-                                    let p_next =
-                                        self.image_i16[(y + 1) * width..(y + 2) * width].as_ptr();
+        let eroded_pixels: Vec<usize> = if options.binary_open {
+            let chunks = height.saturating_sub(2).div_ceil(chunk_size);
+            (0..chunks)
+                .into_par_iter()
+                .fold(
+                    || Vec::with_capacity(128),
+                    |mut acc, chunk_idx| {
+                        let start_y = 1 + chunk_idx * chunk_size;
+                        let end_y = (start_y + chunk_size).min(height - 1);
+                        for y in start_y..end_y {
+                            let row_offset = y * width;
+                            let p_prev = self.image_i16[(y - 1) * width..y * width].as_ptr();
+                            let p_curr = self.image_i16[y * width..(y + 1) * width].as_ptr();
+                            let p_next = self.image_i16[(y + 1) * width..(y + 2) * width].as_ptr();
 
-                                    for x in 1..width - 1 {
-                                        unsafe {
-                                            // The scalar `th` is already scaled by 128x allowing pure int branching
-                                            if *p_curr.add(x) > th {
-                                                if *p_curr.add(x - 1) > th
-                                                    && *p_curr.add(x + 1) > th
-                                                    && *p_prev.add(x) > th
-                                                    && *p_next.add(x) > th
-                                                {
-                                                    acc.push(row_offset + x);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                acc
-                            },
-                        )
-                        .reduce(Vec::new, |mut a, mut b| {
-                            a.append(&mut b);
-                            a
-                        })
-                } else {
-                    let chunks = height.div_ceil(chunk_size);
-                    (0..chunks)
-                        .into_par_iter()
-                        .fold(
-                            || Vec::with_capacity(128),
-                            |mut acc, chunk_idx| {
-                                let start_y = chunk_idx * chunk_size;
-                                let end_y = (start_y + chunk_size).min(height);
-                                for y in start_y..end_y {
-                                    let row_offset = y * width;
-                                    let r_curr = &self.image_i16[row_offset..row_offset + width];
-                                    for x in 0..width {
-                                        if r_curr[x] > th {
+                            for x in 1..width - 1 {
+                                unsafe {
+                                    // The scalar `threshold` is already scaled by 128x allowing pure int branching
+                                    if *p_curr.add(x) > threshold {
+                                        if *p_curr.add(x - 1) > threshold
+                                            && *p_curr.add(x + 1) > threshold
+                                            && *p_prev.add(x) > threshold
+                                            && *p_next.add(x) > threshold
+                                        {
                                             acc.push(row_offset + x);
                                         }
                                     }
                                 }
-                                acc
-                            },
-                        )
-                        .reduce(Vec::new, |mut a, mut b| {
-                            a.append(&mut b);
-                            a
-                        })
-                }
-            }
-            Threshold::Array(arr) => {
-                if options.binary_open {
-                    let chunks = height.saturating_sub(2).div_ceil(chunk_size);
-                    (0..chunks)
-                        .into_par_iter()
-                        .fold(
-                            || Vec::with_capacity(128),
-                            |mut acc, chunk_idx| {
-                                let start_y = 1 + chunk_idx * chunk_size;
-                                let end_y = (start_y + chunk_size).min(height - 1);
-                                for y in start_y..end_y {
-                                    let row_offset = y * width;
-                                    let p_prev =
-                                        self.image_i16[(y - 1) * width..y * width].as_ptr();
-                                    let p_curr =
-                                        self.image_i16[y * width..(y + 1) * width].as_ptr();
-                                    let p_next =
-                                        self.image_i16[(y + 1) * width..(y + 2) * width].as_ptr();
-
-                                    let t_prev = arr[(y - 1) * width..y * width].as_ptr();
-                                    let t_curr = arr[y * width..(y + 1) * width].as_ptr();
-                                    let t_next = arr[(y + 1) * width..(y + 2) * width].as_ptr();
-
-                                    for x in 1..width - 1 {
-                                        unsafe {
-                                            if *p_curr.add(x) > *t_curr.add(x) {
-                                                if *p_curr.add(x - 1) > *t_curr.add(x - 1)
-                                                    && *p_curr.add(x + 1) > *t_curr.add(x + 1)
-                                                    && *p_prev.add(x) > *t_prev.add(x)
-                                                    && *p_next.add(x) > *t_next.add(x)
-                                                {
-                                                    acc.push(row_offset + x);
-                                                }
-                                            }
-                                        }
-                                    }
+                            }
+                        }
+                        acc
+                    },
+                )
+                .reduce(Vec::new, |mut a, mut b| {
+                    a.append(&mut b);
+                    a
+                })
+        } else {
+            let chunks = height.div_ceil(chunk_size);
+            (0..chunks)
+                .into_par_iter()
+                .fold(
+                    || Vec::with_capacity(128),
+                    |mut acc, chunk_idx| {
+                        let start_y = chunk_idx * chunk_size;
+                        let end_y = (start_y + chunk_size).min(height);
+                        for y in start_y..end_y {
+                            let row_offset = y * width;
+                            let r_curr = &self.image_i16[row_offset..row_offset + width];
+                            for x in 0..width {
+                                if r_curr[x] > threshold {
+                                    acc.push(row_offset + x);
                                 }
-                                acc
-                            },
-                        )
-                        .reduce(Vec::new, |mut a, mut b| {
-                            a.append(&mut b);
-                            a
-                        })
-                } else {
-                    let chunks = height.div_ceil(chunk_size);
-                    (0..chunks)
-                        .into_par_iter()
-                        .fold(
-                            || Vec::with_capacity(128),
-                            |mut acc, chunk_idx| {
-                                let start_y = chunk_idx * chunk_size;
-                                let end_y = (start_y + chunk_size).min(height);
-                                for y in start_y..end_y {
-                                    let row_offset = y * width;
-                                    let r_curr = &self.image_i16[row_offset..row_offset + width];
-                                    let t_curr = &arr[row_offset..row_offset + width];
-                                    for x in 0..width {
-                                        if r_curr[x] > t_curr[x] {
-                                            acc.push(row_offset + x);
-                                        }
-                                    }
-                                }
-                                acc
-                            },
-                        )
-                        .reduce(Vec::new, |mut a, mut b| {
-                            a.append(&mut b);
-                            a
-                        })
-                }
-            }
+                            }
+                        }
+                        acc
+                    },
+                )
+                .reduce(Vec::new, |mut a, mut b| {
+                    a.append(&mut b);
+                    a
+                })
         };
 
-        // Binary Dilation
+        // Binary dilation
         self.mask.resize(width * height, false);
         self.mask.fill(false);
 
@@ -1561,7 +1473,7 @@ impl Extractor {
             extracted.truncate(max_ret);
         }
 
-        // 8. Centroid Window
+        // 8. Centroid window
         if let Some(mut window) = options.centroid_window {
             window = window.min(height).min(width);
             for centroid in &mut extracted {
@@ -1620,8 +1532,8 @@ impl Extractor {
         }
     }
 
-    /// Fused F32 Pipeline: Provides 100% exact bit-for-bit math identical to the standard f32 pipeline,
-    /// but slashes memory traffic from 42MB down to 10MB by computing the subtraction on the fly.
+    /// Fused f32 pipeline: Provides 100% exact bit-for-bit math identical to the standard f32 pipeline,
+    /// but slashes memory traffic by computing the subtraction on the fly.
     fn extract_fused_f32_pipeline(
         &mut self,
         src: &[u8],
@@ -1646,7 +1558,7 @@ impl Extractor {
             match mode {
                 BgSubMode::LocalMean => {
                     self.scratch_u16.resize(width * height, 0);
-                    // OPTIMIZATION: One pass reads u8, blurs using lightweight u16, outputs perfect f32 subtraction.
+                    // One pass reads u8, blurs using lightweight u16, outputs f32 subtraction.
                     fast_box_blur_2d_u8_to_f32_subtracted(
                         src,
                         &mut self.scratch_u16,
@@ -1735,8 +1647,7 @@ impl Extractor {
         };
 
         // 4. Threshold to find binary mask
-        // Note: Because self.image_vec contains EXACTLY the same floats as the standard pipeline,
-        // this loop is bit-for-bit identical to the original logic, guaranteeing matching centroid output.
+        // Note: Because self.image_vec contains the same floats as the standard pipeline, this loop is bit-for-bit identical to the original logic, guaranteeing matching centroid output.
         let chunk_size = (height / rayon::current_num_threads()).max(64);
 
         let eroded_pixels: Vec<usize> = if options.binary_open {
@@ -1802,7 +1713,7 @@ impl Extractor {
                 })
         };
 
-        // Binary Dilation
+        // Binary dilation
         self.mask.resize(width * height, false);
         self.mask.fill(false);
 
@@ -1952,7 +1863,7 @@ impl Extractor {
             extracted.truncate(max_ret);
         }
 
-        // 8. Centroid Window
+        // 8. Centroid window
         if let Some(mut window) = options.centroid_window {
             window = window.min(height).min(width);
             for centroid in &mut extracted {
@@ -2011,7 +1922,7 @@ impl Extractor {
         }
     }
 
-    /// Shared internal pipeline containing Steps 2-9 for standard f32 inputs or Late-Promotion formats.
+    /// Shared internal pipeline containing Steps 2-9 for standard f32 inputs or late-promotion formats.
     fn extract_f32_pipeline(
         &mut self,
         width: usize,
@@ -2462,7 +2373,7 @@ impl Extractor {
             }
         };
 
-        // Binary Dilation
+        // Binary dilation
         self.mask.resize(width * height, false);
         self.mask.fill(false);
 
@@ -2612,7 +2523,7 @@ impl Extractor {
             extracted.truncate(max_ret);
         }
 
-        // 8. Centroid Window
+        // 8. Centroid window
         if let Some(mut window) = options.centroid_window {
             window = window.min(height).min(width);
             for centroid in &mut extracted {

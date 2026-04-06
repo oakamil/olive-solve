@@ -491,6 +491,8 @@ fn test_extraction_against_python_full() {
     run_validation_suite_from_fixtures(&bg_modes, &sigma_modes, &downsamples);
 }
 
+/// Fully instrumented u8 validation suite. Loads Python JSON ground-truths
+/// and validates the integer pipeline identically to the f32 pipeline.
 fn run_validation_suite_u8(
     bg_modes: &[(Option<tetra3::extractor::BgSubMode>, &str)],
     sigma_modes: &[(tetra3::extractor::SigmaMode, &str)],
@@ -507,13 +509,43 @@ fn run_validation_suite_u8(
 
     for &ds_opt in downsamples {
         let ds_val = ds_opt.unwrap_or(1);
+        let ds_str = ds_opt
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "none".to_string());
 
         for (bg_rs, bg_py) in bg_modes {
             for (sig_rs, sig_py) in sigma_modes {
+                let zip_name = format!("py-{}-{}-{}.zip", bg_py.to_lowercase(), sig_py, ds_str);
+                let zip_path = PathBuf::from("tests/fixtures").join(&zip_name);
+
+                println!(
+                    "\nValidating u8 configuration against fixture: {}",
+                    zip_name
+                );
+
+                if !zip_path.exists() {
+                    panic!(
+                        "Fixture {} not found! Run `cargo test generate_python_test_fixtures --release -- --ignored` first.",
+                        zip_name
+                    );
+                }
+
+                // 1. Read JSON ground truth from Zip
+                let file = File::open(&zip_path).unwrap();
+                let mut archive = zip::ZipArchive::new(file).unwrap();
+                let mut results_file = archive.by_name("results.json").unwrap();
+                let py_results: Vec<PyImageResult> =
+                    serde_json::from_reader(&mut results_file).unwrap();
+
                 let mut total_rust_time = Duration::ZERO;
                 let mut centroids_found = 0;
 
-                for (_img_name, base_img) in &base_images {
+                for (img_name, base_img) in &base_images {
+                    let py_img_res = py_results
+                        .iter()
+                        .find(|r| r.image_name == *img_name)
+                        .unwrap();
+
                     let (w, h) = base_img.dimensions();
                     let new_w = w - (w % ds_val as u32);
                     let new_h = h - (h % ds_val as u32);
@@ -540,6 +572,225 @@ fn run_validation_suite_u8(
                     let rust_result = extractor.extract_u8(&rust_input_img, options);
                     total_rust_time += start_rust.elapsed();
                     centroids_found += rust_result.centroids.len();
+
+                    let q_sum = |v: f64| (v * 1000.0).round() as i64;
+                    let q_coord = |v: f64| (v * 10.0).round() as i64;
+
+                    let mut rust_centroids_sorted = rust_result.centroids.clone();
+                    rust_centroids_sorted.sort_by(|a, b| {
+                        q_sum(b.sum)
+                            .cmp(&q_sum(a.sum))
+                            .then_with(|| q_coord(a.y).cmp(&q_coord(b.y)))
+                            .then_with(|| q_coord(a.x).cmp(&q_coord(b.x)))
+                    });
+
+                    let mut py_centroids_sorted = py_img_res.centroids.iter().collect::<Vec<_>>();
+                    py_centroids_sorted.sort_by(|a, b| {
+                        q_sum(b.sum)
+                            .cmp(&q_sum(a.sum))
+                            .then_with(|| q_coord(a.y).cmp(&q_coord(b.y)))
+                            .then_with(|| q_coord(a.x).cmp(&q_coord(b.x)))
+                    });
+
+                    let eps = 1e-3;
+                    let mut mismatch_detected = false;
+
+                    if rust_centroids_sorted.len() != py_centroids_sorted.len() {
+                        mismatch_detected = true;
+                    } else {
+                        for i in 0..rust_centroids_sorted.len() {
+                            let r_c = &rust_centroids_sorted[i];
+                            let p_c = py_centroids_sorted[i];
+
+                            if (r_c.y - p_c.y).abs() >= eps
+                                || (r_c.x - p_c.x).abs() >= eps
+                                || (r_c.sum - p_c.sum).abs() / p_c.sum.max(1.0) >= 1e-4
+                            {
+                                mismatch_detected = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if mismatch_detected {
+                        let total_len = rust_centroids_sorted.len().max(py_centroids_sorted.len());
+                        let mut first_mismatch_idx = 0;
+                        for i in 0..total_len {
+                            let r_c_match = rust_centroids_sorted.get(i);
+                            let p_c_match = py_centroids_sorted.get(i);
+
+                            let mut row_mismatch = false;
+                            if let (Some(r), Some(&p)) = (r_c_match, p_c_match) {
+                                if (r.y - p.y).abs() >= eps
+                                    || (r.x - p.x).abs() >= eps
+                                    || (r.sum - p.sum).abs() / p.sum.max(1.0) >= 1e-4
+                                {
+                                    row_mismatch = true;
+                                }
+                            } else {
+                                row_mismatch = true;
+                            }
+
+                            if row_mismatch {
+                                first_mismatch_idx = i;
+                                break;
+                            }
+                        }
+
+                        println!("\n=======================================================");
+                        println!(
+                            "U8 MISMATCH DETECTED: [{:?} | bg: {}, sig: {}, ds: {:?}]",
+                            img_name, bg_py, sig_py, ds_opt
+                        );
+                        println!(
+                            "Rust u8 total: {}, Py total: {}",
+                            rust_centroids_sorted.len(),
+                            py_centroids_sorted.len()
+                        );
+                        println!(
+                            "Showing window around first failure at index {}",
+                            first_mismatch_idx
+                        );
+                        println!(
+                            "{:<5} | {:<30} | {:<30}",
+                            "Index", "Rust u8 (Y, X, Sum, Area)", "Python (Y, X, Sum, Area)"
+                        );
+                        println!("-------------------------------------------------------");
+
+                        let start_idx = first_mismatch_idx.saturating_sub(5);
+                        let end_idx = (first_mismatch_idx + 15).min(total_len);
+
+                        if start_idx > 0 {
+                            println!("...   | ...                            | ...");
+                        }
+
+                        for i in start_idx..end_idx {
+                            let r_str = if i < rust_centroids_sorted.len() {
+                                let c = &rust_centroids_sorted[i];
+                                format!("({:.1}, {:.1}, {:.1}, {})", c.y, c.x, c.sum, c.area)
+                            } else {
+                                "NONE".to_string()
+                            };
+
+                            let p_str = if i < py_centroids_sorted.len() {
+                                let p = py_centroids_sorted[i];
+                                format!("({:.1}, {:.1}, {:.1}, {})", p.y, p.x, p.sum, p.area)
+                            } else {
+                                "NONE".to_string()
+                            };
+
+                            let marker = if r_str != p_str { " * " } else { "   " };
+                            println!("{:<5}{}| {:<30} | {:<30}", i, marker, r_str, p_str);
+                        }
+
+                        if end_idx < total_len {
+                            println!("...   | ...                            | ...");
+                        }
+                        println!("=======================================================\n");
+                    }
+
+                    assert_eq!(
+                        rust_centroids_sorted.len(),
+                        py_centroids_sorted.len(),
+                        "[{:?} | bg: {}, sig: {}, ds: {:?}] Length mismatch",
+                        img_name,
+                        bg_py,
+                        sig_py,
+                        ds_opt
+                    );
+
+                    for i in 0..rust_centroids_sorted.len() {
+                        let r_c = &rust_centroids_sorted[i];
+                        let p_c = py_centroids_sorted[i];
+
+                        assert!(
+                            (r_c.y - p_c.y).abs() < eps,
+                            "[{:?} | bg: {}, sig: {}, ds: {:?}] Y mismatch at sorted index {}: Rust {} vs Py {}",
+                            img_name,
+                            bg_py,
+                            sig_py,
+                            ds_opt,
+                            i,
+                            r_c.y,
+                            p_c.y
+                        );
+                        assert!(
+                            (r_c.x - p_c.x).abs() < eps,
+                            "[{:?} | bg: {}, sig: {}, ds: {:?}] X mismatch at sorted index {}: Rust {} vs Py {}",
+                            img_name,
+                            bg_py,
+                            sig_py,
+                            ds_opt,
+                            i,
+                            r_c.x,
+                            p_c.x
+                        );
+                        assert!(
+                            (r_c.sum - p_c.sum).abs() / p_c.sum.max(1.0) < 1e-4,
+                            "[{:?} | bg: {}, sig: {}, ds: {:?}] Sum mismatch at sorted index {} (y:{:.1}, x:{:.1}): Rust {} vs Py {}",
+                            img_name,
+                            bg_py,
+                            sig_py,
+                            ds_opt,
+                            i,
+                            r_c.y,
+                            r_c.x,
+                            r_c.sum,
+                            p_c.sum
+                        );
+                        assert_eq!(
+                            r_c.area, p_c.area,
+                            "[{:?} | bg: {}, sig: {}, ds: {:?}] Area mismatch at sorted index {} (y:{:.1}, x:{:.1}): Rust {} vs Py {}",
+                            img_name, bg_py, sig_py, ds_opt, i, r_c.y, r_c.x, r_c.area, p_c.area
+                        );
+
+                        if !p_c.m2_xx.is_nan() && !r_c.m2_xx.is_nan() {
+                            assert!(
+                                (r_c.m2_xx - p_c.m2_xx).abs() < eps,
+                                "[{:?} | bg: {}, sig: {}, ds: {:?}] m2_xx mismatch at sorted index {}: Rust {} vs Py {}",
+                                img_name,
+                                bg_py,
+                                sig_py,
+                                ds_opt,
+                                i,
+                                r_c.m2_xx,
+                                p_c.m2_xx
+                            );
+                            assert!(
+                                (r_c.m2_yy - p_c.m2_yy).abs() < eps,
+                                "[{:?} | bg: {}, sig: {}, ds: {:?}] m2_yy mismatch at sorted index {}: Rust {} vs Py {}",
+                                img_name,
+                                bg_py,
+                                sig_py,
+                                ds_opt,
+                                i,
+                                r_c.m2_yy,
+                                p_c.m2_yy
+                            );
+                            assert!(
+                                (r_c.m2_xy - p_c.m2_xy).abs() < eps,
+                                "[{:?} | bg: {}, sig: {}, ds: {:?}] m2_xy mismatch at sorted index {}: Rust {} vs Py {}",
+                                img_name,
+                                bg_py,
+                                sig_py,
+                                ds_opt,
+                                i,
+                                r_c.m2_xy,
+                                p_c.m2_xy
+                            );
+                            assert!(
+                                (r_c.axis_ratio - p_c.axis_ratio).abs() < eps,
+                                "[{:?} | bg: {}, sig: {}, ds: {:?}] Axis ratio mismatch at sorted index {}: Rust {} vs Py {}",
+                                img_name,
+                                bg_py,
+                                sig_py,
+                                ds_opt,
+                                i,
+                                r_c.axis_ratio,
+                                p_c.axis_ratio
+                            );
+                        }
+                    }
                 }
 
                 println!(
@@ -1238,8 +1489,8 @@ fn test_grayscale_vs_cedar() {
     println!(
         "\n{:<40} | {:<10} | {:<10} | {:<10} | {:<10} | {:<18} | {:<22}",
         "Image",
-        "Port u8",
         "Port f32",
+        "Port u8",
         "Fast u8",
         "Cedar",
         "Top 4 Match (u8)",
@@ -1251,8 +1502,8 @@ fn test_grayscale_vs_cedar() {
         println!(
             "{:<40} | {:<10} | {:<10} | {:<10} | {:<10} | {:<18} | {:<22}",
             row.img_name,
-            row.port_u8_count,
             row.port_f32_count,
+            row.port_u8_count,
             row.fast_u8_count,
             row.cedar_count,
             row.match_str_u8,
@@ -1261,19 +1512,19 @@ fn test_grayscale_vs_cedar() {
     }
 
     println!(
-        "\n\n{:<40} | {:<22} | {:<22} | {:<22} | {:<22}",
-        "Image", "Port u8 Solved", "Fast u8 Solved", "Cedar Solved", "Original f32 Solved"
+        "\n\n{:<40} | {:<25} | {:<25} | {:<25} | {:<25}",
+        "Image", "Color f32 Solved", "Port u8 Solved", "Fast u8 Solved", "Cedar Solved"
     );
-    println!("{}", "-".repeat(140));
+    println!("{}", "-".repeat(154));
 
     for row in &table_rows {
         println!(
-            "{:<40} | {:<22} | {:<22} | {:<22} | {:<22}",
+            "{:<40} | {:<25} | {:<25} | {:<25} | {:<25}",
             row.img_name,
+            row.orig_f32_solve_str,
             row.u8_solve_str,
             row.fast_u8_solve_str,
-            row.cedar_solve_str,
-            row.orig_f32_solve_str
+            row.cedar_solve_str
         );
     }
     println!();
