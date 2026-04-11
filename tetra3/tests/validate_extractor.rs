@@ -16,7 +16,9 @@ use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use cedar_detect::algorithm::{estimate_noise_from_image, get_stars_from_image};
-use tetra3::fast_extractor::{FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor};
+use tetra3::fast_extractor::{
+    FastBgSubMode, FastDownsample, FastExtractOptions, FastExtractor, FastSigmaMode,
+};
 use tetra3::{ExtractOptions, Extractor, SolveOptions, SolveStatus, Solver};
 
 // Use Rust 1.77+ c"..." literals for PyO3 0.21+ CStr requirements
@@ -1764,4 +1766,58 @@ fn test_fast_extractor_vs_others() {
         );
     }
     println!();
+}
+
+#[test]
+#[ignore]
+fn test_benchmark_block_median() {
+    let iterations = 200;
+    let image_paths = get_test_images();
+    let downsamples = [FastDownsample::None, FastDownsample::X2, FastDownsample::X4];
+
+    for &ds in &downsamples {
+        let mut total_time = Duration::ZERO;
+
+        // Use the first image for benchmarking to keep it consistent
+        let path = &image_paths[0];
+        let base_img = image::open(path).unwrap();
+        let (w, h) = base_img.dimensions();
+
+        let ds_factor = ds.factor() as u32;
+        let new_w = w - (w % ds_factor);
+        let new_h = h - (h % ds_factor);
+
+        let mut input_img = ndarray::Array2::<u8>::zeros((new_h as usize, new_w as usize));
+        let luma_img = base_img.to_luma8();
+        for y in 0..new_h {
+            for x in 0..new_w {
+                input_img[[y as usize, x as usize]] = luma_img.get_pixel(x, y)[0];
+            }
+        }
+
+        let options = FastExtractOptions {
+            downsample: ds,
+            bg_sub_mode: Some(FastBgSubMode::BlockMedian { block_size: 64 }),
+            sigma_mode: FastSigmaMode::GlobalRootSquare,
+            ..Default::default()
+        };
+
+        let mut extractor = FastExtractor::new(new_w as usize, new_h as usize, options);
+
+        println!(
+            "Benchmarking BlockMedian + GlobalRootSquare (Downsample: {:?}, Iterations: {})...",
+            ds, iterations
+        );
+
+        for _ in 0..iterations {
+            let start = Instant::now();
+            let _res = extractor.extract(&input_img);
+            total_time += start.elapsed();
+        }
+
+        let avg_time = total_time / iterations as u32;
+        println!("  -> Average Time: {:.2?}", avg_time);
+        println!("  -> Total Time:   {:.2?}", total_time);
+        println!("----------------------------------------------");
+    }
 }

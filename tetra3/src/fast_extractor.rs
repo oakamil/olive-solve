@@ -137,7 +137,6 @@ pub struct FastExtractor {
     // -------------------------------------------------------------------------
     bg_grid: Vec<f32>,
     bg_gx0: Vec<usize>,
-    bg_gx1: Vec<usize>,
     bg_tx: Vec<f32>,
     bg_gy0: Vec<usize>,
     bg_gy1: Vec<usize>,
@@ -165,7 +164,6 @@ impl FastExtractor {
 
         let mut bg_grid = Vec::new();
         let mut bg_gx0 = vec![0; out_width];
-        let mut bg_gx1 = vec![0; out_width];
         let mut bg_tx = vec![0.0; out_width];
         let mut bg_gy0 = vec![0; out_height];
         let mut bg_gy1 = vec![0; out_height];
@@ -181,7 +179,6 @@ impl FastExtractor {
                 let cx = (x as f32 / block_size as f32) - 0.5;
                 let gx0 = cx.floor().clamp(0.0, grid_w.saturating_sub(1) as f32) as usize;
                 bg_gx0[x] = gx0;
-                bg_gx1[x] = (gx0 + 1).min(grid_w.saturating_sub(1));
                 bg_tx[x] = cx - cx.floor();
             }
 
@@ -229,7 +226,6 @@ impl FastExtractor {
             median_scratch_i32: Vec::with_capacity(out_pixels),
             bg_grid,
             bg_gx0,
-            bg_gx1,
             bg_tx,
             bg_gy0,
             bg_gy1,
@@ -358,38 +354,64 @@ impl FastExtractor {
                     FastBgSubMode::BlockMedian { block_size } => {
                         let grid_w = (self.out_width + block_size - 1) / block_size;
 
-                        // Compute medians for each block in the grid
-                        self.bg_grid.par_iter_mut().enumerate().for_each_init(
-                            || Vec::with_capacity(block_size * block_size),
-                            |block_pixels, (i, grid_val)| {
-                                let gx = i % grid_w;
-                                let gy = i / grid_w;
-                                let start_x = gx * block_size;
-                                let start_y = gy * block_size;
-                                let end_x = (start_x + block_size).min(self.out_width);
-                                let end_y = (start_y + block_size).min(self.out_height);
+                        // Compute medians for each block in the grid using histograms.
+                        // We process by rows of blocks to read the source image only once.
+                        self.bg_grid
+                            .par_chunks_exact_mut(grid_w)
+                            .enumerate()
+                            .for_each_init(
+                                || Vec::new(),
+                                |hists, (gy, bg_row)| {
+                                    let hist_size = 4096;
+                                    let total_hists_size = grid_w * hist_size;
+                                    if hists.len() < total_hists_size {
+                                        hists.resize(total_hists_size, 0u32);
+                                    }
+                                    hists.fill(0);
 
-                                block_pixels.clear();
-                                for y in start_y..end_y {
-                                    let row_start = y * self.out_width;
-                                    for x in start_x..end_x {
-                                        unsafe {
-                                            block_pixels.push(
-                                                *self.downsampled_u32.get_unchecked(row_start + x),
-                                            );
+                                    let start_y = gy * block_size;
+                                    let end_y = (start_y + block_size).min(self.out_height);
+
+                                    for y in start_y..end_y {
+                                        let row_start = y * self.out_width;
+                                        let row = &self.downsampled_u32
+                                            [row_start..row_start + self.out_width];
+                                        for gx in 0..grid_w {
+                                            let start_x = gx * block_size;
+                                            let end_x = (start_x + block_size).min(self.out_width);
+                                            let hist_offset = gx * hist_size;
+                                            for x in start_x..end_x {
+                                                unsafe {
+                                                    let p = *row.get_unchecked(x);
+                                                    *hists.get_unchecked_mut(
+                                                        hist_offset + p as usize,
+                                                    ) += 1;
+                                                }
+                                            }
                                         }
                                     }
-                                }
-                                let mid = block_pixels.len() / 2;
-                                let (_, &mut median, _) = block_pixels.select_nth_unstable(mid);
-                                *grid_val = median as f32;
-                            },
-                        );
+
+                                    for gx in 0..grid_w {
+                                        let hist = &hists[gx * hist_size..(gx + 1) * hist_size];
+                                        let start_x = gx * block_size;
+                                        let end_x = (start_x + block_size).min(self.out_width);
+                                        let count = (end_y - start_y) * (end_x - start_x);
+                                        let target = ((count + 1) / 2) as u32;
+                                        let mut accum = 0;
+                                        for (val, &c) in hist.iter().enumerate() {
+                                            accum += c;
+                                            if accum >= target {
+                                                bg_row[gx] = val as f32;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                },
+                            );
 
                         // Isolate LUTs to satisfy borrow checker
                         let bg_grid = &self.bg_grid;
                         let bg_gx0 = &self.bg_gx0;
-                        let bg_gx1 = &self.bg_gx1;
                         let bg_tx = &self.bg_tx;
                         let bg_gy0 = &self.bg_gy0;
                         let bg_gy1 = &self.bg_gy1;
@@ -409,20 +431,27 @@ impl FastExtractor {
                                 let row_v0 = &bg_grid[row0_start..row0_start + grid_w];
                                 let row_v1 = &bg_grid[row1_start..row1_start + grid_w];
 
+                                // Pre-calculate interpolated grid medians for this row to reduce inner loop math.
+                                // 1024 is sufficient for images up to 16K with block size 16.
+                                let mut v_grid_row = [0.0f32; 1024];
+                                let mut d_grid_row = [0.0f32; 1024];
+                                let active_grid_w = grid_w.min(1024);
+                                for gx in 0..active_grid_w {
+                                    let v0 = row_v0[gx];
+                                    let v1 = row_v1[gx];
+                                    v_grid_row[gx] = v0 + ty * (v1 - v0);
+                                }
+                                for gx in 0..active_grid_w.saturating_sub(1) {
+                                    d_grid_row[gx] = v_grid_row[gx + 1] - v_grid_row[gx];
+                                }
+
                                 for x in 0..self.out_width {
                                     unsafe {
                                         let gx0 = *bg_gx0.get_unchecked(x);
-                                        let gx1 = *bg_gx1.get_unchecked(x);
                                         let tx = *bg_tx.get_unchecked(x);
 
-                                        let v00 = *row_v0.get_unchecked(gx0);
-                                        let v10 = *row_v0.get_unchecked(gx1);
-                                        let v01 = *row_v1.get_unchecked(gx0);
-                                        let v11 = *row_v1.get_unchecked(gx1);
-
-                                        let interp_top = v00 + tx * (v10 - v00);
-                                        let interp_bot = v01 + tx * (v11 - v01);
-                                        let bg_val = interp_top + ty * (interp_bot - interp_top);
+                                        // Optimized bilinear interpolation: reduces 3 fmuls + 3 fadds to 1 fmul + 1 fadd
+                                        let bg_val = v_grid_row[gx0] + tx * d_grid_row[gx0];
 
                                         let val_f32 = (*src_row.get_unchecked(x) as f32) - bg_val;
                                         *out_row.get_unchecked_mut(x) =
@@ -522,36 +551,63 @@ impl FastExtractor {
                     FastBgSubMode::BlockMedian { block_size } => {
                         let grid_w = (self.width + block_size - 1) / block_size;
 
-                        self.bg_grid.par_iter_mut().enumerate().for_each_init(
-                            || Vec::with_capacity(block_size * block_size),
-                            |block_pixels, (i, grid_val)| {
-                                let gx = i % grid_w;
-                                let gy = i / grid_w;
-                                let start_x = gx * block_size;
-                                let start_y = gy * block_size;
-                                let end_x = (start_x + block_size).min(self.width);
-                                let end_y = (start_y + block_size).min(self.height);
+                        // Compute medians for each block in the grid using histograms.
+                        // We process by rows of blocks to read the source image only once.
+                        self.bg_grid
+                            .par_chunks_exact_mut(grid_w)
+                            .enumerate()
+                            .for_each_init(
+                                || Vec::new(),
+                                |hists, (gy, bg_row)| {
+                                    let hist_size = 256;
+                                    let total_hists_size = grid_w * hist_size;
+                                    if hists.len() < total_hists_size {
+                                        hists.resize(total_hists_size, 0u32);
+                                    }
+                                    hists.fill(0);
 
-                                block_pixels.clear();
-                                for y in start_y..end_y {
-                                    let row_start = y * self.width;
-                                    for x in start_x..end_x {
-                                        unsafe {
-                                            block_pixels
-                                                .push(*src_slice.get_unchecked(row_start + x));
+                                    let start_y = gy * block_size;
+                                    let end_y = (start_y + block_size).min(self.height);
+
+                                    for y in start_y..end_y {
+                                        let row_start = y * self.width;
+                                        let row = &src_slice[row_start..row_start + self.width];
+                                        for gx in 0..grid_w {
+                                            let start_x = gx * block_size;
+                                            let end_x = (start_x + block_size).min(self.width);
+                                            let hist_offset = gx * hist_size;
+                                            for x in start_x..end_x {
+                                                unsafe {
+                                                    let p = *row.get_unchecked(x);
+                                                    *hists.get_unchecked_mut(
+                                                        hist_offset + p as usize,
+                                                    ) += 1;
+                                                }
+                                            }
                                         }
                                     }
-                                }
-                                let mid = block_pixels.len() / 2;
-                                let (_, &mut median, _) = block_pixels.select_nth_unstable(mid);
-                                *grid_val = median as f32;
-                            },
-                        );
+
+                                    for gx in 0..grid_w {
+                                        let hist = &hists[gx * hist_size..(gx + 1) * hist_size];
+                                        let start_x = gx * block_size;
+                                        let end_x = (start_x + block_size).min(self.width);
+                                        let count = (end_y - start_y) * (end_x - start_x);
+                                        let target = ((count + 1) / 2) as u32;
+                                        let mut accum = 0;
+                                        for (val, &c) in hist.iter().enumerate() {
+                                            accum += c;
+                                            if accum >= target {
+                                                bg_row[gx] = val as f32;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                },
+                            );
 
                         // Isolate LUTs to satisfy borrow checker
                         let bg_grid = &self.bg_grid;
                         let bg_gx0 = &self.bg_gx0;
-                        let bg_gx1 = &self.bg_gx1;
                         let bg_tx = &self.bg_tx;
                         let bg_gy0 = &self.bg_gy0;
                         let bg_gy1 = &self.bg_gy1;
@@ -570,20 +626,27 @@ impl FastExtractor {
                                 let row_v0 = &bg_grid[row0_start..row0_start + grid_w];
                                 let row_v1 = &bg_grid[row1_start..row1_start + grid_w];
 
+                                // Pre-calculate interpolated grid medians for this row to reduce inner loop math.
+                                // 1024 is sufficient for images up to 16K with block size 16.
+                                let mut v_grid_row = [0.0f32; 1024];
+                                let mut d_grid_row = [0.0f32; 1024];
+                                let active_grid_w = grid_w.min(1024);
+                                for gx in 0..active_grid_w {
+                                    let v0 = row_v0[gx];
+                                    let v1 = row_v1[gx];
+                                    v_grid_row[gx] = v0 + ty * (v1 - v0);
+                                }
+                                for gx in 0..active_grid_w.saturating_sub(1) {
+                                    d_grid_row[gx] = v_grid_row[gx + 1] - v_grid_row[gx];
+                                }
+
                                 for x in 0..self.width {
                                     unsafe {
                                         let gx0 = *bg_gx0.get_unchecked(x);
-                                        let gx1 = *bg_gx1.get_unchecked(x);
                                         let tx = *bg_tx.get_unchecked(x);
 
-                                        let v00 = *row_v0.get_unchecked(gx0);
-                                        let v10 = *row_v0.get_unchecked(gx1);
-                                        let v01 = *row_v1.get_unchecked(gx0);
-                                        let v11 = *row_v1.get_unchecked(gx1);
-
-                                        let interp_top = v00 + tx * (v10 - v00);
-                                        let interp_bot = v01 + tx * (v11 - v01);
-                                        let bg_val = interp_top + ty * (interp_bot - interp_top);
+                                        // Optimized bilinear interpolation: reduces 3 fmuls + 3 fadds to 1 fmul + 1 fadd
+                                        let bg_val = v_grid_row[gx0] + tx * d_grid_row[gx0];
 
                                         let val_f32 = (*src_row.get_unchecked(x) as f32) - bg_val;
                                         *out_row.get_unchecked_mut(x) =
