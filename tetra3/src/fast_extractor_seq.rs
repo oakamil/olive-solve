@@ -173,6 +173,88 @@ impl FastExtractor {
                         }
                         sum_sq
                     }
+                    FastBgSubMode::LineMedian => {
+                        let mut hist = [0u32; 4096];
+                        let mut total_sum_sq = 0.0;
+                        let mut o_rows = self.image_i32.chunks_exact_mut(self.out_width);
+                        let mut i_rows = self.downsampled_u32.chunks_exact(self.out_width);
+
+                        for (o_row, i_row) in o_rows.zip(i_rows) {
+                            hist.fill(0);
+                            let mut count = 0;
+
+                            // OPTIMIZATION: Cache-line aligned interleaved sampling.
+                            // Reads 64 contiguous pixels, then skips 64. This halves memory
+                            // bandwidth while keeping hardware prefetchers perfectly fed.
+                            let mut chunks = i_row.chunks_exact(128);
+                            for chunk in chunks.by_ref() {
+                                for &v in &chunk[0..64] {
+                                    unsafe {
+                                        *hist.get_unchecked_mut(v as usize) += 1;
+                                    }
+                                }
+                                count += 64;
+                            }
+
+                            // Handle the remainder of the row safely
+                            let rem = chunks.remainder();
+                            let rem_read = rem.len().min(64);
+                            if rem_read > 0 {
+                                for &v in &rem[0..rem_read] {
+                                    unsafe {
+                                        *hist.get_unchecked_mut(v as usize) += 1;
+                                    }
+                                }
+                                count += rem_read as usize;
+                            }
+
+                            let target = ((count + 1) / 2) as u32;
+                            let mut accum = 0;
+                            let mut med = 0.0f32;
+                            for (val, &c) in hist.iter().enumerate() {
+                                accum += c;
+                                if accum >= target {
+                                    med = val as f32;
+                                    break;
+                                }
+                            }
+
+                            let mut sum_sq0 = 0.0;
+                            let mut sum_sq1 = 0.0;
+                            let mut sum_sq2 = 0.0;
+                            let mut sum_sq3 = 0.0;
+                            let mut o_chunks = o_row.chunks_exact_mut(4);
+                            let mut i_chunks = i_row.chunks_exact(4);
+
+                            for (o, i) in o_chunks.by_ref().zip(i_chunks.by_ref()) {
+                                let v0 = (i[0] as f32) - med;
+                                let v1 = (i[1] as f32) - med;
+                                let v2 = (i[2] as f32) - med;
+                                let v3 = (i[3] as f32) - med;
+                                o[0] = (v0 * 128.0).round() as i32;
+                                o[1] = (v1 * 128.0).round() as i32;
+                                o[2] = (v2 * 128.0).round() as i32;
+                                o[3] = (v3 * 128.0).round() as i32;
+                                sum_sq0 += (v0 * v0) as f64;
+                                sum_sq1 += (v1 * v1) as f64;
+                                sum_sq2 += (v2 * v2) as f64;
+                                sum_sq3 += (v3 * v3) as f64;
+                            }
+
+                            let mut row_sum_sq = sum_sq0 + sum_sq1 + sum_sq2 + sum_sq3;
+                            for (o, &i) in o_chunks
+                                .into_remainder()
+                                .iter_mut()
+                                .zip(i_chunks.remainder().iter())
+                            {
+                                let val_f32 = (i as f32) - med;
+                                *o = (val_f32 * 128.0).round() as i32;
+                                row_sum_sq += (val_f32 * val_f32) as f64;
+                            }
+                            total_sum_sq += row_sum_sq;
+                        }
+                        total_sum_sq
+                    }
                     FastBgSubMode::BlockMedian { block_size } => {
                         let grid_w = (self.out_width + block_size - 1) / block_size;
                         let grid_h = (self.out_height + block_size - 1) / block_size;
@@ -441,6 +523,88 @@ impl FastExtractor {
                             sum_sq += (val_f32 * val_f32) as f64;
                         }
                         sum_sq
+                    }
+                    FastBgSubMode::LineMedian => {
+                        let mut hist = [0u32; 256];
+                        let mut total_sum_sq = 0.0;
+                        let mut o_rows = self.image_i16.chunks_exact_mut(self.width);
+                        let mut i_rows = src_slice.chunks_exact(self.width);
+
+                        for (o_row, i_row) in o_rows.zip(i_rows) {
+                            hist.fill(0);
+                            let mut count = 0;
+
+                            // OPTIMIZATION: Cache-line aligned interleaved sampling.
+                            // Reads 64 contiguous pixels, then skips 64. This halves memory
+                            // bandwidth while keeping hardware prefetchers perfectly fed.
+                            let mut chunks = i_row.chunks_exact(128);
+                            for chunk in chunks.by_ref() {
+                                for &v in &chunk[0..64] {
+                                    unsafe {
+                                        *hist.get_unchecked_mut(v as usize) += 1;
+                                    }
+                                }
+                                count += 64;
+                            }
+
+                            // Handle the remainder of the row safely
+                            let rem = chunks.remainder();
+                            let rem_read = rem.len().min(64);
+                            if rem_read > 0 {
+                                for &v in &rem[0..rem_read] {
+                                    unsafe {
+                                        *hist.get_unchecked_mut(v as usize) += 1;
+                                    }
+                                }
+                                count += rem_read as usize;
+                            }
+
+                            let target = ((count + 1) / 2) as u32;
+                            let mut accum = 0;
+                            let mut med = 0.0f32;
+                            for (val, &c) in hist.iter().enumerate() {
+                                accum += c;
+                                if accum >= target {
+                                    med = val as f32;
+                                    break;
+                                }
+                            }
+
+                            let mut sum_sq0 = 0.0;
+                            let mut sum_sq1 = 0.0;
+                            let mut sum_sq2 = 0.0;
+                            let mut sum_sq3 = 0.0;
+                            let mut o_chunks = o_row.chunks_exact_mut(4);
+                            let mut i_chunks = i_row.chunks_exact(4);
+
+                            for (o, i) in o_chunks.by_ref().zip(i_chunks.by_ref()) {
+                                let v0 = (i[0] as f32) - med;
+                                let v1 = (i[1] as f32) - med;
+                                let v2 = (i[2] as f32) - med;
+                                let v3 = (i[3] as f32) - med;
+                                o[0] = (v0 * 128.0).round() as i16;
+                                o[1] = (v1 * 128.0).round() as i16;
+                                o[2] = (v2 * 128.0).round() as i16;
+                                o[3] = (v3 * 128.0).round() as i16;
+                                sum_sq0 += (v0 * v0) as f64;
+                                sum_sq1 += (v1 * v1) as f64;
+                                sum_sq2 += (v2 * v2) as f64;
+                                sum_sq3 += (v3 * v3) as f64;
+                            }
+
+                            let mut row_sum_sq = sum_sq0 + sum_sq1 + sum_sq2 + sum_sq3;
+                            for (o, &i) in o_chunks
+                                .into_remainder()
+                                .iter_mut()
+                                .zip(i_chunks.remainder().iter())
+                            {
+                                let val_f32 = (i as f32) - med;
+                                *o = (val_f32 * 128.0).round() as i16;
+                                row_sum_sq += (val_f32 * val_f32) as f64;
+                            }
+                            total_sum_sq += row_sum_sq;
+                        }
+                        total_sum_sq
                     }
                     FastBgSubMode::BlockMedian { block_size } => {
                         let grid_w = (self.width + block_size - 1) / block_size;

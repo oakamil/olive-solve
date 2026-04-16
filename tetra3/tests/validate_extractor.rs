@@ -1805,6 +1805,7 @@ fn test_benchmark_bg_sub_modes() {
     let modes = [
         (Some(FastBgSubMode::GlobalMean), "GlobalMean"),
         (Some(FastBgSubMode::GlobalMedian), "GlobalMedian"),
+        (Some(FastBgSubMode::LineMedian), "LineMedian"),
         (
             Some(FastBgSubMode::BlockMedian { block_size: 64 }),
             "BlockMedian(64)",
