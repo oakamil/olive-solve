@@ -210,47 +210,34 @@ impl FastExtractor {
 
                             let target = ((count + 1) / 2) as u32;
                             let mut accum = 0;
-                            let mut med = 0.0f32;
+                            let mut med_val = 0u32;
                             for (val, &c) in hist.iter().enumerate() {
                                 accum += c;
                                 if accum >= target {
-                                    med = val as f32;
+                                    med_val = val as u32;
                                     break;
                                 }
                             }
 
-                            let mut sum_sq0 = 0.0;
-                            let mut sum_sq1 = 0.0;
-                            let mut sum_sq2 = 0.0;
-                            let mut sum_sq3 = 0.0;
-                            let mut o_chunks = o_row.chunks_exact_mut(4);
-                            let mut i_chunks = i_row.chunks_exact(4);
+                            // OPTIMIZATION: Pure Integer Hot Loop
+                            // Eliminates float casting, rounding, and multiplication per pixel.
+                            let med_i32 = med_val as i32;
+                            let mut sum_i = 0u64;
+                            let mut sum_sq_i = 0u64;
 
-                            for (o, i) in o_chunks.by_ref().zip(i_chunks.by_ref()) {
-                                let v0 = (i[0] as f32) - med;
-                                let v1 = (i[1] as f32) - med;
-                                let v2 = (i[2] as f32) - med;
-                                let v3 = (i[3] as f32) - med;
-                                o[0] = (v0 * 128.0).round() as i32;
-                                o[1] = (v1 * 128.0).round() as i32;
-                                o[2] = (v2 * 128.0).round() as i32;
-                                o[3] = (v3 * 128.0).round() as i32;
-                                sum_sq0 += (v0 * v0) as f64;
-                                sum_sq1 += (v1 * v1) as f64;
-                                sum_sq2 += (v2 * v2) as f64;
-                                sum_sq3 += (v3 * v3) as f64;
+                            // Standard zip loop vectorizes natively via LLVM
+                            for (o, &i) in o_row.iter_mut().zip(i_row.iter()) {
+                                let iv = i as u64;
+                                sum_i += iv;
+                                sum_sq_i += iv * iv;
+                                *o = (i as i32 - med_i32) * 128;
                             }
 
-                            let mut row_sum_sq = sum_sq0 + sum_sq1 + sum_sq2 + sum_sq3;
-                            for (o, &i) in o_chunks
-                                .into_remainder()
-                                .iter_mut()
-                                .zip(i_chunks.remainder().iter())
-                            {
-                                let val_f32 = (i as f32) - med;
-                                *o = (val_f32 * 128.0).round() as i32;
-                                row_sum_sq += (val_f32 * val_f32) as f64;
-                            }
+                            // Calculate mathematically equivalent variance exactly once per row
+                            let med_f64 = med_val as f64;
+                            let n_f64 = self.out_width as f64;
+                            let row_sum_sq = (sum_sq_i as f64) - 2.0 * med_f64 * (sum_i as f64)
+                                + n_f64 * med_f64 * med_f64;
                             total_sum_sq += row_sum_sq;
                         }
                         total_sum_sq
@@ -561,47 +548,30 @@ impl FastExtractor {
 
                             let target = ((count + 1) / 2) as u32;
                             let mut accum = 0;
-                            let mut med = 0.0f32;
+                            let mut med_val = 0u32;
                             for (val, &c) in hist.iter().enumerate() {
                                 accum += c;
                                 if accum >= target {
-                                    med = val as f32;
+                                    med_val = val as u32;
                                     break;
                                 }
                             }
 
-                            let mut sum_sq0 = 0.0;
-                            let mut sum_sq1 = 0.0;
-                            let mut sum_sq2 = 0.0;
-                            let mut sum_sq3 = 0.0;
-                            let mut o_chunks = o_row.chunks_exact_mut(4);
-                            let mut i_chunks = i_row.chunks_exact(4);
+                            let med_i32 = med_val as i32;
+                            let mut sum_i = 0u64;
+                            let mut sum_sq_i = 0u64;
 
-                            for (o, i) in o_chunks.by_ref().zip(i_chunks.by_ref()) {
-                                let v0 = (i[0] as f32) - med;
-                                let v1 = (i[1] as f32) - med;
-                                let v2 = (i[2] as f32) - med;
-                                let v3 = (i[3] as f32) - med;
-                                o[0] = (v0 * 128.0).round() as i16;
-                                o[1] = (v1 * 128.0).round() as i16;
-                                o[2] = (v2 * 128.0).round() as i16;
-                                o[3] = (v3 * 128.0).round() as i16;
-                                sum_sq0 += (v0 * v0) as f64;
-                                sum_sq1 += (v1 * v1) as f64;
-                                sum_sq2 += (v2 * v2) as f64;
-                                sum_sq3 += (v3 * v3) as f64;
+                            for (o, &i) in o_row.iter_mut().zip(i_row.iter()) {
+                                let iv = i as u64;
+                                sum_i += iv;
+                                sum_sq_i += iv * iv;
+                                *o = ((i as i32 - med_i32) * 128) as i16;
                             }
 
-                            let mut row_sum_sq = sum_sq0 + sum_sq1 + sum_sq2 + sum_sq3;
-                            for (o, &i) in o_chunks
-                                .into_remainder()
-                                .iter_mut()
-                                .zip(i_chunks.remainder().iter())
-                            {
-                                let val_f32 = (i as f32) - med;
-                                *o = (val_f32 * 128.0).round() as i16;
-                                row_sum_sq += (val_f32 * val_f32) as f64;
-                            }
+                            let med_f64 = med_val as f64;
+                            let n_f64 = self.width as f64;
+                            let row_sum_sq = (sum_sq_i as f64) - 2.0 * med_f64 * (sum_i as f64)
+                                + n_f64 * med_f64 * med_f64;
                             total_sum_sq += row_sum_sq;
                         }
                         total_sum_sq

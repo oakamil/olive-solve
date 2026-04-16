@@ -394,30 +394,54 @@ impl FastExtractor {
                                 || vec![0u32; 4096], // Safely bounds ds=4 max accumulation (4080)
                                 |hist, (o_row, i_row)| {
                                     hist.fill(0);
-                                    for &i in i_row {
-                                        unsafe {
-                                            *hist.get_unchecked_mut(i as usize) += 1;
+                                    let mut count = 0;
+
+                                    let mut chunks = i_row.chunks_exact(128);
+                                    for chunk in chunks.by_ref() {
+                                        for &v in &chunk[0..64] {
+                                            unsafe {
+                                                *hist.get_unchecked_mut(v as usize) += 1;
+                                            }
                                         }
+                                        count += 64;
+                                    }
+                                    let rem = chunks.remainder();
+                                    let rem_read = rem.len().min(64);
+                                    if rem_read > 0 {
+                                        for &v in &rem[0..rem_read] {
+                                            unsafe {
+                                                *hist.get_unchecked_mut(v as usize) += 1;
+                                            }
+                                        }
+                                        count += rem_read as usize;
                                     }
 
-                                    let target = ((self.out_width + 1) / 2) as u32;
+                                    let target = ((count + 1) / 2) as u32;
                                     let mut accum = 0;
-                                    let mut med = 0.0f32;
+                                    let mut med_val = 0u32;
                                     for (val, &c) in hist.iter().enumerate() {
                                         accum += c;
                                         if accum >= target {
-                                            med = val as f32;
+                                            med_val = val as u32;
                                             break;
                                         }
                                     }
 
-                                    let mut row_sum_sq = 0.0;
+                                    let med_i32 = med_val as i32;
+                                    let mut sum_i = 0u64;
+                                    let mut sum_sq_i = 0u64;
+
                                     for (o, &i) in o_row.iter_mut().zip(i_row.iter()) {
-                                        let val_f32 = (i as f32) - med;
-                                        *o = (val_f32 * 128.0).round() as i32;
-                                        row_sum_sq += (val_f32 * val_f32) as f64;
+                                        let iv = i as u64;
+                                        sum_i += iv;
+                                        sum_sq_i += iv * iv;
+                                        *o = (i as i32 - med_i32) * 128;
                                     }
-                                    row_sum_sq
+
+                                    let med_f64 = med_val as f64;
+                                    let n_f64 = self.out_width as f64;
+                                    (sum_sq_i as f64) - 2.0 * med_f64 * (sum_i as f64)
+                                        + n_f64 * med_f64 * med_f64
                                 },
                             )
                             .sum()
@@ -666,30 +690,54 @@ impl FastExtractor {
                                 || vec![0u32; 256],
                                 |hist, (o_row, i_row)| {
                                     hist.fill(0);
-                                    for &i in i_row {
-                                        unsafe {
-                                            *hist.get_unchecked_mut(i as usize) += 1;
+                                    let mut count = 0;
+
+                                    let mut chunks = i_row.chunks_exact(128);
+                                    for chunk in chunks.by_ref() {
+                                        for &v in &chunk[0..64] {
+                                            unsafe {
+                                                *hist.get_unchecked_mut(v as usize) += 1;
+                                            }
                                         }
+                                        count += 64;
+                                    }
+                                    let rem = chunks.remainder();
+                                    let rem_read = rem.len().min(64);
+                                    if rem_read > 0 {
+                                        for &v in &rem[0..rem_read] {
+                                            unsafe {
+                                                *hist.get_unchecked_mut(v as usize) += 1;
+                                            }
+                                        }
+                                        count += rem_read as usize;
                                     }
 
-                                    let target = ((self.width + 1) / 2) as u32;
+                                    let target = ((count + 1) / 2) as u32;
                                     let mut accum = 0;
-                                    let mut med = 0.0f32;
+                                    let mut med_val = 0u32;
                                     for (val, &c) in hist.iter().enumerate() {
                                         accum += c;
                                         if accum >= target {
-                                            med = val as f32;
+                                            med_val = val as u32;
                                             break;
                                         }
                                     }
 
-                                    let mut row_sum_sq = 0.0;
+                                    let med_i32 = med_val as i32;
+                                    let mut sum_i = 0u64;
+                                    let mut sum_sq_i = 0u64;
+
                                     for (o, &i) in o_row.iter_mut().zip(i_row.iter()) {
-                                        let val_f32 = (i as f32) - med;
-                                        *o = (val_f32 * 128.0).round() as i16;
-                                        row_sum_sq += (val_f32 * val_f32) as f64;
+                                        let iv = i as u64;
+                                        sum_i += iv;
+                                        sum_sq_i += iv * iv;
+                                        *o = ((i as i32 - med_i32) * 128) as i16;
                                     }
-                                    row_sum_sq
+
+                                    let med_f64 = med_val as f64;
+                                    let n_f64 = self.width as f64;
+                                    (sum_sq_i as f64) - 2.0 * med_f64 * (sum_i as f64)
+                                        + n_f64 * med_f64 * med_f64
                                 },
                             )
                             .sum()
