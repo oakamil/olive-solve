@@ -176,8 +176,8 @@ impl FastExtractor {
                     FastBgSubMode::LineMedian => {
                         let mut hist = [0u32; 4096];
                         let mut total_sum_sq = 0.0;
-                        let mut o_rows = self.image_i32.chunks_exact_mut(self.out_width);
-                        let mut i_rows = self.downsampled_u32.chunks_exact(self.out_width);
+                        let o_rows = self.image_i32.chunks_exact_mut(self.out_width);
+                        let i_rows = self.downsampled_u32.chunks_exact(self.out_width);
 
                         for (o_row, i_row) in o_rows.zip(i_rows) {
                             hist.fill(0);
@@ -527,8 +527,8 @@ impl FastExtractor {
                     FastBgSubMode::LineMedian => {
                         let mut hist = [0u32; 256];
                         let mut total_sum_sq = 0.0;
-                        let mut o_rows = self.image_i16.chunks_exact_mut(self.width);
-                        let mut i_rows = src_slice.chunks_exact(self.width);
+                        let o_rows = self.image_i16.chunks_exact_mut(self.width);
+                        let i_rows = src_slice.chunks_exact(self.width);
 
                         for (o_row, i_row) in o_rows.zip(i_rows) {
                             hist.fill(0);
