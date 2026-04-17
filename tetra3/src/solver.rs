@@ -1432,44 +1432,38 @@ impl Solver {
         // Thinning strategy
         let pattern_stars_separation_pixels =
             width * separation_for_density(fov_initial, verification_stars as f64) / fov_initial;
-        let mut keep_for_patterns = vec![false; num_centroids_raw];
+
+        // Populate our extracted stars directly
+        let mut image_centroids: Vec<[f64; 2]> = Vec::with_capacity(verification_stars);
 
         for i in 0..num_centroids_raw {
             let mut occupied = false;
             let c_i = star_centroids.row(i);
-            for j in 0..i {
-                if keep_for_patterns[j] {
-                    let c_j = star_centroids.row(j);
-                    if ((c_i[0] - c_j[0]).powi(2) + (c_i[1] - c_j[1]).powi(2)).sqrt()
-                        < pattern_stars_separation_pixels
-                    {
-                        occupied = true;
-                        break;
-                    }
+
+            // Only check spatial distance against the handful of stars we've already kept
+            for c_j in &image_centroids {
+                if ((c_i[0] - c_j[0]).powi(2) + (c_i[1] - c_j[1]).powi(2)).sqrt()
+                    < pattern_stars_separation_pixels
+                {
+                    occupied = true;
+                    break;
                 }
             }
+
             if !occupied {
-                keep_for_patterns[i] = true;
+                image_centroids.push([c_i[0], c_i[1]]);
+                // Break early once we have enough well-spaced stars
+                if image_centroids.len() == verification_stars {
+                    break;
+                }
             }
         }
 
-        let mut pattern_centroids_inds: Vec<usize> = keep_for_patterns
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, keep)| if keep { Some(i) } else { None })
-            .collect();
+        let num_extracted_stars = image_centroids.len();
 
-        let mut num_extracted_stars = num_centroids_raw;
-        if num_centroids_raw > verification_stars {
-            num_extracted_stars = verification_stars;
-            pattern_centroids_inds.retain(|&i| i < num_extracted_stars);
-        }
-
-        // Maintain the original full set of image_centroids for the final matrix building
-        let mut image_centroids = Vec::with_capacity(num_extracted_stars);
-        for i in 0..num_extracted_stars {
-            image_centroids.push([star_centroids[[i, 0]], star_centroids[[i, 1]]]);
-        }
+        // Because image_centroids contains exactly our thinned stars, the indirection
+        // array maps cleanly 1:1, preventing array out-of-bounds in the combinatorics loop.
+        let pattern_centroids_inds: Vec<usize> = (0..num_extracted_stars).collect();
 
         let mut image_centroids_undist = if let Some(k) = options.distortion {
             undistort_centroids(&image_centroids, height, width, k)
