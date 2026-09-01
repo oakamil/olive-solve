@@ -1188,13 +1188,14 @@ impl Solver {
                 Ok((data_u32, nrows))
             };
 
-        let read_1d_f32 = |arc: &mut ZipArchive<File>, name: &str| -> Option<Vec<f32>> {
+        let read_1d_f16_to_f32 = |arc: &mut ZipArchive<File>, name: &str| -> Option<Vec<f32>> {
             arc.by_name(name).ok().and_then(|mut zf| {
                 let mut buf = Vec::new();
                 zf.read_to_end(&mut buf).ok()?;
                 let mut cursor = Cursor::new(&buf);
                 let npy = NpyFile::new(&mut cursor).ok()?;
-                npy.into_vec().ok()
+                let vec_f16: Vec<half::f16> = npy.into_vec().ok()?;
+                Some(vec_f16.into_iter().map(|f| f.to_f32()).collect())
             })
         };
 
@@ -1261,7 +1262,7 @@ impl Solver {
         let (pattern_catalog_flat, num_patterns_from_arr) =
             read_pattern_catalog(&mut archive, "pattern_catalog.npy")?;
         let star_table_data = read_star_table(&mut archive, "star_table.npy")?;
-        let pattern_largest_edge = read_1d_f32(&mut archive, "pattern_largest_edge.npy");
+        let pattern_largest_edge = read_1d_f16_to_f32(&mut archive, "pattern_largest_edge.npy");
         let pattern_key_hashes = read_1d_u16(&mut archive, "pattern_key_hashes.npy");
         let star_catalog_ids = read_star_catalog_ids(&mut archive, "star_catalog_IDs.npy");
 

@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 zip = "0.6"
 ndarray = { version = "0.17.1" }
-npyz = "0.8"
+npyz = { version = "0.8", features = ["half"] }
+half = "2.3"
 kiddo = { version = "4.2.0", features = ["immutable"] }
 nalgebra = "0.34.1"
 pyo3 = { version = "0.28.3", features = ["abi3", "abi3-py38"], optional = true }

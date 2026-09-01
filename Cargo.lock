@@ -2081,6 +2081,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f0e759e014e630f90af745101b614f761306ddc541681e546649068e25ec1b9"
 dependencies = [
  "byteorder",
+ "half",
  "num-bigint",
  "py_literal",
 ]
@@ -3222,6 +3223,7 @@ name = "tetra3"
 version = "0.1.0"
 dependencies = [
  "cedar_detect",
+ "half",
  "image",
  "kiddo",
  "nalgebra 0.34.1",
