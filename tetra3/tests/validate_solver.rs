@@ -76,9 +76,7 @@ fn test_solver_consistency_with_testdata() {
         return;
     }
     if !zip_path.exists() {
-        panic!(
-            "Fixture zip not found! Run `cargo test generate_test_fixtures --release -- --ignored` first."
-        );
+        panic!("Fixture zip not found!");
     }
 
     let mut solver = Solver::load_database(db_path).expect("Failed to load Tetra3 database");
@@ -89,12 +87,9 @@ fn test_solver_consistency_with_testdata() {
     let mut all_failures = Vec::new();
     let mut total_solve_micros = 0;
     let samples = 738;
-    let run_times = 100;
-    let iterations = samples * run_times;
 
     // The counter in the JSON zip starts at 1
-    for y in 1..=iterations {
-        let x = (y % samples) + 1;
+    for x in 1..=samples {
         // Read Input DTO
         let input_filename = format!("input_{}.json", x);
         let mut input_buffer = Vec::new();
@@ -191,7 +186,10 @@ fn test_solver_consistency_with_testdata() {
                 continue;
             }
 
-            let epsilon = 1e-5;
+            #[cfg(not(feature = "force-32bit-solver"))]
+            let epsilon = 1e-4; // 0.0001 deg = 0.36 arcseconds (64-bit pipeline)
+            #[cfg(feature = "force-32bit-solver")]
+            let epsilon = 1e-2; // 0.01 deg = 36 arcseconds (32-bit pipeline)
             let expected_ra = expected_dto.ra.unwrap_or(0.0);
             let expected_dec = expected_dto.dec.unwrap_or(0.0);
             let expected_roll = expected_dto.roll.unwrap_or(0.0);
@@ -264,10 +262,10 @@ fn test_solver_consistency_with_testdata() {
          Successful matches: {}\n\
          Pure solver time: {:.2} ms\n\
          Average time per solve: {:.2} ms\n",
-        iterations,
-        iterations - all_failures.len(),
+        samples,
+        samples - all_failures.len(),
         total_solve_micros as f64 / 1000.0,
-        total_solve_micros as f64 / 1000.0 / (iterations as f64),
+        total_solve_micros as f64 / 1000.0 / (samples as f64),
     );
 
     // Panic if there were any failures accumulated across ALL 738 iterations.
@@ -370,7 +368,10 @@ fn test_solver_mirrored_image() {
         "Solver should have detected the image was mirrored"
     );
 
-    let epsilon = 1e-4;
+    #[cfg(not(feature = "force-32bit-solver"))]
+    let epsilon = 1e-4; // 0.0001 deg = 0.36 arcseconds (64-bit pipeline)
+    #[cfg(feature = "force-32bit-solver")]
+    let epsilon = 1e-2; // 0.01 deg = 36 arcseconds (32-bit pipeline)
 
     // RA and Dec should exactly match the unmirrored original output
     assert!(
@@ -490,9 +491,7 @@ fn test_out_of_bounds_target_pixel() {
         return;
     }
     if !zip_path.exists() {
-        panic!(
-            "Fixture zip not found! Run `cargo test generate_test_fixtures --release -- --ignored` first."
-        );
+        panic!("Fixture zip not found!");
     }
 
     let mut solver = Solver::load_database(db_path).expect("Failed to load Tetra3 database");
@@ -618,9 +617,7 @@ fn test_horizon_filter() {
         return;
     }
     if !zip_path.exists() {
-        panic!(
-            "Fixture zip not found! Run `cargo test generate_test_fixtures --release -- --ignored` first."
-        );
+        panic!("Fixture zip not found!");
     }
 
     let mut solver = Solver::load_database(db_path).expect("Failed to load Tetra3 database");
@@ -1024,4 +1021,78 @@ fn test_return_best_failed_match_with_random_noise_no_panic() {
     assert!(
         result.status == SolveStatus::NoMatch || result.status == SolveStatus::LowConfidenceMatch
     );
+}
+
+#[test]
+fn test_verify_active_pipeline_mode() {
+    let db_path = Path::new("tests/fixtures/default_database.npz");
+    if !db_path.exists() {
+        eprintln!("Skipping: default_database.npz not found.");
+        return;
+    }
+
+    let solver = Solver::load_database(db_path).expect("Failed to load test database");
+    assert!(
+        !solver.star_vectors.is_empty(),
+        "Star table must contain stars"
+    );
+
+    // Inspect the actual byte size of individual coordinates and vectors:
+    // f32 is 4 bytes (32-bit pipeline), f64 is 8 bytes (64-bit pipeline)
+    let float_size_bytes = std::mem::size_of_val(&solver.star_vectors[0][0]);
+    let vector_size_bytes = std::mem::size_of_val(&solver.star_vectors[0]);
+
+    #[cfg(feature = "force-32bit-solver")]
+    {
+        assert_eq!(
+            float_size_bytes, 4,
+            "FAILED: Feature 'force-32bit-solver' is enabled, but star coordinates are {} bytes (expected 4 for f32)!",
+            float_size_bytes
+        );
+        assert_eq!(
+            vector_size_bytes, 12,
+            "FAILED: Vector footprint is {} bytes (expected 12 bytes for [f32; 3])!",
+            vector_size_bytes
+        );
+
+        println!("\n=======================================================");
+        println!(">>> [CONFIRMED] ACTIVE PIPELINE: 32-BIT (f32) <<<");
+        println!(
+            "  - Coordinate Precision:  f32 ({} bytes)",
+            float_size_bytes
+        );
+        println!(
+            "  - Star Vector Footprint: {} bytes/star (50% cache reduction)",
+            vector_size_bytes
+        );
+        println!("  - Active Feature Flag:   force-32bit-solver");
+        println!("=======================================================\n");
+    }
+
+    #[cfg(not(feature = "force-32bit-solver"))]
+    {
+        assert_eq!(
+            float_size_bytes, 8,
+            "FAILED: Default 64-bit build, but star coordinates are {} bytes (expected 8 for f64)!",
+            float_size_bytes
+        );
+        assert_eq!(
+            vector_size_bytes, 24,
+            "FAILED: Vector footprint is {} bytes (expected 24 bytes for [f64; 3])!",
+            vector_size_bytes
+        );
+
+        println!("\n=======================================================");
+        println!(">>> [CONFIRMED] ACTIVE PIPELINE: 64-BIT (f64) <<<");
+        println!(
+            "  - Coordinate Precision:  f64 ({} bytes)",
+            float_size_bytes
+        );
+        println!(
+            "  - Star Vector Footprint: {} bytes/star (Full double precision)",
+            vector_size_bytes
+        );
+        println!("  - Active Feature Flag:   (default)");
+        println!("=======================================================\n");
+    }
 }

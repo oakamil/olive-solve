@@ -9,6 +9,7 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 python = ["dep:pyo3", "dep:numpy", "tetra3/python"]
+force-32bit-solver = ["tetra3/force-32bit-solver"]
 
 [dependencies]
 pyo3 = { version = "0.28.2", features = ["extension-module"], optional = true }
