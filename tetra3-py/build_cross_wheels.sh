@@ -22,32 +22,21 @@ echo "    Tetra3 Embedded Python Wheel Builder (on Pi 5)     "
 echo "========================================================"
 
 # Virtual Environment & Tooling Verification
-if ! command -v maturin &>/dev/null; then
+if ! command -v maturin &>/dev/null || ! command -v zig &>/dev/null; then
     VENV_DIR=".env"
     if [ ! -d "$VENV_DIR" ]; then
-        echo "[Setup] No maturin found in PATH. Creating virtualenv in ./$VENV_DIR..."
+        echo "[Setup] Missing tooling. Creating virtualenv in ./$VENV_DIR..."
         python3 -m venv "$VENV_DIR"
     fi
     echo "[Setup] Activating virtual environment $VENV_DIR..."
     source "$VENV_DIR/bin/activate"
-    if ! command -v maturin &>/dev/null; then
-        echo "[Setup] Installing maturin in virtualenv..."
+    if ! command -v maturin &>/dev/null || ! command -v zig &>/dev/null; then
+        echo "[Setup] Installing maturin and zig in virtualenv..."
         pip install --upgrade pip
-        pip install maturin
+        pip install maturin ziglang cargo-zigbuild
     fi
 fi
 
-# Verify Cross Linker
-check_cross_linker() {
-    if ! command -v arm-linux-gnueabihf-gcc &>/dev/null; then
-        echo ""
-        echo "ERROR: Cross-linker 'arm-linux-gnueabihf-gcc' not found!"
-        echo "Please install it on your Pi 5 by running:"
-        echo "    sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf"
-        echo ""
-        exit 1
-    fi
-}
 
 # Ensure rustup target is installed
 ensure_rust_target() {
@@ -70,10 +59,10 @@ build_zero2w() {
 build_zero1() {
     echo ""
     echo ">>> [2/3] Building Raspberry Pi Zero 1 Wheel (ARMv6, force-32bit-solver)..."
-    check_cross_linker
     ensure_rust_target "arm-unknown-linux-gnueabihf"
-    maturin build \
+    CFLAGS="-mcpu=arm1176jzf_s" CXXFLAGS="-mcpu=arm1176jzf_s" maturin build \
         --release \
+        --zig \
         --target arm-unknown-linux-gnueabihf \
         --features force-32bit-solver \
         --strip
@@ -83,10 +72,10 @@ build_zero1() {
 build_rv1103() {
     echo ""
     echo ">>> [3/3] Building Rockchip RV1103 Wheel (Cortex-A7 + NEON, force-32bit-solver)..."
-    check_cross_linker
     ensure_rust_target "armv7-unknown-linux-gnueabihf"
-    maturin build \
+    CFLAGS="-mcpu=cortex_a7" CXXFLAGS="-mcpu=cortex_a7" maturin build \
         --release \
+        --zig \
         --target armv7-unknown-linux-gnueabihf \
         --features force-32bit-solver \
         --strip
@@ -96,10 +85,10 @@ build_rv1103() {
 build_rv1103_musl() {
     echo ""
     echo ">>> Building Rockchip RV1103 musl Wheel (Buildroot, force-32bit-solver)..."
-    check_cross_linker
     ensure_rust_target "armv7-unknown-linux-musleabihf"
-    maturin build \
+    CFLAGS="-mcpu=cortex_a7" CXXFLAGS="-mcpu=cortex_a7" maturin build \
         --release \
+        --zig \
         --target armv7-unknown-linux-musleabihf \
         --features force-32bit-solver \
         --strip

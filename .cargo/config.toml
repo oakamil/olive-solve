@@ -1,21 +1,20 @@
 # Target 1: Raspberry Pi Zero 1 (ARMv6ZK + VFPv2, strictly NO NEON)
 [target.arm-unknown-linux-gnueabihf]
-linker = "arm-linux-gnueabihf-gcc"
 rustflags = [
     "-C", "target-cpu=arm1176jzf-s",
 ]
 
 # Target 2: Rockchip RV1103 (Cortex-A7 + NEON SIMD + VFPv4)
 [target.armv7-unknown-linux-gnueabihf]
-linker = "arm-linux-gnueabihf-gcc"
 rustflags = [
     "-C", "target-cpu=cortex-a7",
+    "-C", "target-feature=+neon,+vfp4",
 ]
 
 [target.armv7-unknown-linux-musleabihf]
-linker = "arm-linux-gnueabihf-gcc"
 rustflags = [
     "-C", "target-cpu=cortex-a7",
+    "-C", "target-feature=+neon,+vfp4",
 ]
 
 # Target 3: Raspberry Pi Zero 2W and Pi 3/4/5 (AArch64 Cortex-A53)
