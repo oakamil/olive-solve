@@ -1,10 +1,8 @@
 // Copyright (c) 2026 Omair Kamil
 //
-// This file is a derivative work - a Python interface to the optimized Rust port
-// of the cedar-solve and esa/tetra3 projects. The original underlying code is
-// licensed under the Apache License, Version 2.0.
-// Original Copyright (c) European Space Agency, Steven Rosenthal, brownj4, and
-// contributors.
+// This file is a derivative work, inspired from `tetra3.py` of the cedar-solve and
+// esa/tetra3 projects. This file has major optimizations of algorithms in those
+// works with additional original computational logic.
 //
 // This derivative work is licensed under the Apache License, Version 2.0 (the
 // "License"). You may not use this file except in compliance with the License.
@@ -438,6 +436,7 @@ fn rotate_vectors_inplace_with_f64_rot(
 // Running the 3x3 SVD in f64 guarantees exact orthogonalization and sub-arcsecond
 // attitude parity with zero precision loss while taking < 50 us on ARM Cortex-A7.
 // =========================================================================
+// OPTIMIZATION: Pure-Rust stack-allocated SVD (via nalgebra). Replaces dynamic DMatrix matching.
 fn find_rotation_matrix_and_det_inplace_f64(
     image_vectors: &[[Flt; 3]],
     catalog_vectors: &[[Flt; 3]],
@@ -651,6 +650,7 @@ fn verify_and_build_solution(
     let p_raw = 1.0 - prob_single_star_mismatch;
     let k_raw = num_extracted_stars as i64 - (num_star_matches as i64 - 2);
 
+    // Safe bounds bypass replicating scipy.stats.binom.cdf behavior
     let prob_mismatch = fast_binomial_cdf(k_raw, num_extracted_stars as u64, p_raw);
     let is_match = prob_mismatch < match_threshold;
 
@@ -695,6 +695,8 @@ fn verify_and_build_solution(
     let mut k_final = options.distortion;
     if options.distortion.is_some() {
         // Refine fov & distortion using Least Squares System
+        // A = [tangent, radius^3], b = [radius]
+        // Note: To fully map lstsq in Rust precisely, build A and B for all matched_stars
         rotate_vectors_inplace_with_f64_rot(
             &precise_rotation_matrix,
             &scratch.sp_matched_cat_vecs,
@@ -1453,6 +1455,7 @@ impl Solver {
                                 "presort_patterns".to_string(),
                                 if presort { 1.0 } else { 0.0 },
                             );
+                            // num_patterns is already set globally based on pattern_catalog_arr.nrows() / 2
                         }
                     }
                 }

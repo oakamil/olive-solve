@@ -1,10 +1,8 @@
 // Copyright (c) 2026 Omair Kamil
 //
-// This file is a derivative work - a Python interface to the optimized Rust port
-// of the cedar-solve and esa/tetra3 projects. The original underlying code is
-// licensed under the Apache License, Version 2.0.
-// Original Copyright (c) European Space Agency, Steven Rosenthal, brownj4, and
-// contributors.
+// This file is a derivative work, inspired from `tetra3.py` of the cedar-solve and
+// esa/tetra3 projects. This file has major optimizations of algorithms in those
+// works with additional original computational logic.
 //
 // This derivative work is licensed under the Apache License, Version 2.0 (the
 // "License"). You may not use this file except in compliance with the License.
