@@ -9,19 +9,29 @@
 // A copy of the License is located in the LICENSE.md file in the root of this
 // repository.
 //
-#![allow(missing_docs)]
+//! High-performance, zero-allocation star centroid extraction engine.
+//!
+//! Designed for real-time stellar navigation on embedded microprocessors (e.g. Raspberry Pi
+//! or Rockchip SoC). Maintains fixed-resolution pre-allocated scratch buffers to eliminate heap
+//! allocations during continuous operation. Includes custom background subtraction algorithms
+//! ([`FastBgSubMode::BlockMedian`] and [`FastBgSubMode::LineMedian`]).
+
 use ndarray::{ArrayBase, Data, Ix2};
 use std::cmp::Ordering;
 
+/// Hardware-friendly integer downsampling factor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)]
 pub enum FastDownsample {
+    /// Native sensor resolution (1x).
     None,
+    /// 2x2 integer pixel binning.
     X2,
+    /// 4x4 integer pixel binning.
     X4,
 }
 
 impl FastDownsample {
+    /// Returns the integer scale divisor (1, 2, or 4).
     pub fn factor(&self) -> usize {
         match self {
             FastDownsample::None => 1,
@@ -31,48 +41,77 @@ impl FastDownsample {
     }
 }
 
+/// Fast background subtraction mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)]
 pub enum FastBgSubMode {
+    /// Full-frame scalar median subtraction.
     GlobalMedian,
+    /// Full-frame scalar mean subtraction (fastest).
     GlobalMean,
-    BlockMedian { block_size: usize },
+    /// Tiled block-median subtraction with bilinear interpolation, providing localized
+    /// background removal without sliding-window computational cost.
+    BlockMedian {
+        /// Side length of square tiles in pixels (e.g. 32 or 64).
+        block_size: usize,
+    },
+    /// Per-row line median subtraction, specially designed to remove sensor horizontal banding noise.
     LineMedian,
 }
 
+/// Statistical noise floor estimation mode for the fast pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)]
 pub enum FastSigmaMode {
+    /// Full-frame median absolute deviation (1.4826 * MAD).
     GlobalMedianAbs,
+    /// Full-frame root-mean-square noise estimation.
     GlobalRootSquare,
 }
 
+/// Configuration options for the [`FastExtractor`] engine.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(missing_docs)]
 pub struct FastExtractOptions {
+    /// Multiplier on the estimated noise standard deviation to determine detection threshold.
     pub sigma: f32,
+    /// Hardware downsampling factor applied to input images.
     pub downsample: FastDownsample,
+    /// Selected background subtraction algorithm, or `None` to skip subtraction.
     pub bg_sub_mode: Option<FastBgSubMode>,
+    /// Statistical method used to estimate the noise floor.
     pub sigma_mode: FastSigmaMode,
+    /// If true, applies morphological opening to eliminate isolated single-pixel hot pixels.
     pub binary_open: bool,
+    /// Window size in pixels around detection peaks for moment calculation.
     pub centroid_window: Option<usize>,
+    /// Maximum connected component area in pixels (rejects bloated artifacts).
     pub max_area: Option<usize>,
+    /// Minimum connected component area in pixels (rejects spurious single-pixel noise).
     pub min_area: Option<usize>,
+    /// Maximum integrated flux / pixel sum for valid candidate stars.
     pub max_sum: Option<f64>,
+    /// Minimum integrated flux / pixel sum required for a candidate star.
     pub min_sum: Option<f64>,
+    /// Maximum major-to-minor axis ratio to filter out satellite tracks or streaks.
     pub max_axis_ratio: Option<f64>,
+    /// Optional fixed crop `(width, height)` centered on the optical axis.
     pub crop: Option<(usize, usize)>,
+    /// Optional virtual crop sub-regions evaluated concurrently without re-running extraction.
     pub virtual_crops: Option<Vec<crate::extractor::Crop>>,
+    /// If true, uses fast histogram/sample approximation for background calculations.
     pub approximate_background: bool,
 }
 
+/// Runtime overrides applied to [`FastExtractor`] for multi-variant passes.
 #[derive(Debug, Clone, Default)]
-#[allow(missing_docs)]
 pub struct FastExtractOptionsUpdate {
+    /// Updated sigma detection threshold.
     pub sigma: Option<f32>,
+    /// Updated noise filter (binary opening) flag.
     pub noise_filter: Option<bool>,
+    /// Updated minimum component area in pixels.
     pub min_area: Option<usize>,
+    /// Updated maximum component area in pixels.
     pub max_area: Option<usize>,
+    /// Updated virtual crop regions.
     pub virtual_crops: Option<Option<Vec<crate::extractor::Crop>>>,
 }
 
@@ -97,13 +136,18 @@ impl Default for FastExtractOptions {
     }
 }
 
+/// Star centroid properties computed by [`FastExtractor`].
 #[derive(Debug, Clone)]
-#[allow(missing_docs)]
 pub struct FastCentroidResult {
+    /// Sub-pixel vertical coordinate (row index, 0 at top).
     pub y: f64,
+    /// Sub-pixel horizontal coordinate (column index, 0 at left).
     pub x: f64,
+    /// Total integrated flux / pixel intensity.
     pub sum: f64,
+    /// Connected component pixel area.
     pub area: usize,
+    /// Major axis over minor axis ratio measuring blob roundness.
     pub axis_ratio: f64,
 }
 
@@ -180,18 +224,22 @@ pub struct FastExtractor {
 }
 
 impl FastExtractor {
+    /// Returns a reference to the active extraction options.
     pub fn options(&self) -> &FastExtractOptions {
         &self.options
     }
 
+    /// Returns the original image width this extractor was initialized for.
     pub fn orig_width(&self) -> usize {
         self.orig_width
     }
 
+    /// Returns the original image height this extractor was initialized for.
     pub fn orig_height(&self) -> usize {
         self.orig_height
     }
 
+    /// Updates mutable runtime options (such as sigma threshold or virtual crops).
     pub fn update_options(&mut self, update: FastExtractOptionsUpdate) {
         if let Some(sigma) = update.sigma {
             self.options.sigma = sigma;
@@ -211,7 +259,9 @@ impl FastExtractor {
     }
 
     /// Creates a fully pre-allocated extractor.
-    /// Locks dimensions and options to allow for zero-allocation runtime and LUT generation.
+    ///
+    /// Pre-allocates working buffers and look-up tables based on the expected input dimensions
+    /// and options to guarantee zero heap allocations during steady-state processing.
     pub fn new(width: usize, height: usize, options: FastExtractOptions) -> Self {
         let orig_width = width;
         let orig_height = height;
@@ -358,6 +408,7 @@ impl FastExtractor {
         }
     }
 
+    /// Extracts star centroids from a single `u8` grayscale image.
     pub fn extract<S>(&mut self, input_image: &ArrayBase<S, Ix2>) -> FastExtractionResult
     where
         S: Data<Elem = u8>,
@@ -366,9 +417,8 @@ impl FastExtractor {
             .remove(0)
     }
 
-    /// Fast version of the extractor for f32 input images.
-    /// Performs an extremely fast sequential conversion to u8 internally.
     /// Fast version of the extractor for f32 input images using variants.
+    /// Performs an extremely fast conversion to u8 internally.
     pub fn extract_variants_f32<S>(
         &mut self,
         input_image: &ArrayBase<S, Ix2>,

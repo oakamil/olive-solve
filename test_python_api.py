@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Omair Kamil
+# See LICENSE file in root directory for license terms.
+
 import numpy as np
 from olive_solve import FusedSolver
 import time

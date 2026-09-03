@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Omair Kamil
+# See LICENSE file in root directory for license terms.
 # ==============================================================================
 # Cross-Compilation Wheel Builder for Tetra3 Python Bindings
 # Host: Raspberry Pi 5 (aarch64)

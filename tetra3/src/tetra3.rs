@@ -1,6 +1,11 @@
 // Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
+//! Unified `Tetra3` interface tying together centroid extraction and plate solving.
+//!
+//! Provides the primary [`Tetra3`] facade struct with lazy loading of the star catalog
+//! and shared working extractors.
+
 use ndarray::{Array2, ArrayBase, Data, Ix2};
 use std::path::{Path, PathBuf};
 use std::time::Instant;

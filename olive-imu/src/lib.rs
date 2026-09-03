@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Omair Kamil
+// See LICENSE file in root directory for license terms.
+
 //! `olive-imu` provides abstractions and implementations for Interfacing with
 //! various Inertial Measurement Units (IMUs).
 //! It defines common traits and robust hardware drivers for devices such as

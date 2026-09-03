@@ -1,4 +1,4 @@
-// Required Notice: Copyright (c) 2026 Omair Kamil
+// Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
 //! `test_bias` is a CLI diagnostic tool for analyzing IMU sensor drift.

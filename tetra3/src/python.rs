@@ -1,6 +1,10 @@
 // Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
+//! Python/PyO3 interoperability helpers for the `tetra3` crate.
+//!
+//! Provides conversion functions between native Rust structs and Python dictionaries / NumPy arrays.
+
 use crate::extractor::{BgSubMode, Crop, ExtractOptions, SigmaMode};
 use crate::fast_extractor::{FastBgSubMode, FastDownsample, FastExtractOptions, FastSigmaMode};
 use crate::solver::{Solution, SolveOptions};

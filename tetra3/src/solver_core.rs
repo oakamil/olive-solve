@@ -1087,7 +1087,7 @@ pub struct Scratchpads {
 }
 
 impl Scratchpads {
-    #[allow(missing_docs)]
+    /// Creates a new `Scratchpads` instance pre-allocated for pattern evaluations.
     pub fn new(p_size: usize) -> Self {
         let max_size = p_size.max(6);
         Self {
@@ -1138,27 +1138,33 @@ impl Scratchpads {
 // The original tetra3 algorithm seems to have settled on 4 as the optimal pattern size - its name
 // includes 'tetra' after all.
 //
-#[allow(missing_docs)]
 /// The main solver engine. Highly optimized for plate solving using cedar-solve databases.
 pub struct Solver {
-    // OPTIMIZATION: Highly optimized cache-aligned struct lists
+    /// Unit vectors `[x, y, z]` for all stars in the loaded catalog.
     pub star_vectors: Vec<[Flt; 3]>,
+    /// Metadata (RA, Dec, magnitude) for each star in the catalog.
     pub star_metadata: Vec<StarMetadata>,
+    /// Flattened 4-star catalog index array.
     pub pattern_catalog_flat: Vec<u32>,
-    // OPTIMIZATION: u16 Hash Probe Table (Memory / Cache Optimization)
-    // We use a flat u16 array instead of u32 or a full struct. Halving the footprint from
-    // 4 bytes to 2 bytes ensures it fits better into constrained L2 caches like on the Pi Zero 2W.
+    /// Hash probe table mapping hash indices to catalog entries.
     pub probe_table: Vec<u16>,
+    /// 3D k-d tree spatial index over catalog star unit vectors for rapid neighborhood queries.
     pub star_kd_tree: ImmutableKdTree<Flt, 3>,
+    /// Largest angular edge length for each catalog pattern.
     pub pattern_largest_edge: Option<Vec<f32>>,
+    /// True if the database contains precomputed pattern key hashes.
     pub has_pattern_key_hashes: bool,
+    /// External catalog star identifiers, if present in the database.
     pub star_catalog_ids: Option<Array2<u32>>,
+    /// Database metadata properties (e.g. catalog epochs, FOV bounds).
     pub db_props: HashMap<String, f64>,
+    /// Total count of 4-star patterns in the catalog.
     pub num_patterns: usize,
+    /// True if the hash table uses linear probing for collisions.
     pub linear_probe: bool,
-    pub scratch: Scratchpads, // OPTIMIZATION: Instance-level persistent memory context
-
-    // Control flags for Python threading
+    /// Persistent scratchpad buffers reused across solve calls to eliminate heap allocations.
+    pub scratch: Scratchpads,
+    /// Atomic cancellation flag polled during long searches.
     pub is_cancelled: Arc<AtomicBool>,
 }
 

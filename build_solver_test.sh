@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright (c) 2026 Omair Kamil
+# See LICENSE file in root directory for license terms.
 
 # Exit on any error
 set -e

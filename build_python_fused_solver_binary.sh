@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Omair Kamil
+# See LICENSE file in root directory for license terms.
 # Build script for creating a standalone binary distribution of the fused plate solver.
 
 set -e
