@@ -67,6 +67,15 @@ fn map_solve_options(opt: proto::SolveOptions) -> SolveOptions {
             .unwrap_or(def.return_rotation_matrix),
         target_pixel,
         target_sky_coord,
+        allow_out_of_bounds_target_pixel: opt
+            .allow_out_of_bounds_target_pixel
+            .or(def.allow_out_of_bounds_target_pixel),
+        observer_latitude: opt.observer_latitude.or(def.observer_latitude),
+        observer_lst: opt.observer_lst.or(def.observer_lst),
+        min_boresight_altitude: opt.min_boresight_altitude.or(def.min_boresight_altitude),
+        return_best_failed_match: opt
+            .return_best_failed_match
+            .unwrap_or(def.return_best_failed_match),
     }
 }
 
@@ -133,6 +142,7 @@ fn map_solution(sol: T3Solution, extraction_time_ms: Option<f64>) -> proto::Solu
         SolveStatus::Timeout => proto::SolveStatus::Timeout,
         SolveStatus::Cancelled => proto::SolveStatus::Cancelled,
         SolveStatus::TooFew => proto::SolveStatus::TooFew,
+        SolveStatus::LowConfidenceMatch => proto::SolveStatus::LowConfidenceMatch,
     };
 
     let rotation_matrix = sol
@@ -357,5 +367,67 @@ impl Tetra3Service for Tetra3ServerImpl {
         );
 
         Ok(Response::new(map_solution(solution, Some(ext_elapsed))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_map_solve_options_full_propagation() {
+        let proto_opts = proto::SolveOptions {
+            fov_estimate: Some(12.5),
+            fov_max_error: Some(0.5),
+            match_radius: Some(0.02),
+            match_threshold: Some(1e-6),
+            solve_timeout_ms: Some(2500.0),
+            distortion: Some(0.01),
+            match_max_error: Some(0.003),
+            return_matches: Some(true),
+            return_catalog: Some(true),
+            return_rotation_matrix: Some(true),
+            target_pixel: vec![proto::Pixel { y: 100.0, x: 200.0 }],
+            target_sky_coord: vec![proto::SkyCoord {
+                ra: 45.0,
+                dec: 10.0,
+            }],
+            allow_out_of_bounds_target_pixel: Some(true),
+            observer_latitude: Some(41.5),
+            observer_lst: Some(32.0),
+            min_boresight_altitude: Some(-2.5),
+            return_best_failed_match: Some(true),
+        };
+
+        let t3_opts = map_solve_options(proto_opts);
+
+        assert_eq!(t3_opts.fov_estimate, Some(12.5));
+        assert_eq!(t3_opts.fov_max_error, Some(0.5));
+        assert_eq!(t3_opts.match_radius, 0.02);
+        assert_eq!(t3_opts.match_threshold, 1e-6);
+        assert_eq!(t3_opts.solve_timeout_ms, Some(2500.0));
+        assert_eq!(t3_opts.distortion, Some(0.01));
+        assert_eq!(t3_opts.match_max_error, 0.003);
+        assert!(t3_opts.return_matches);
+        assert!(t3_opts.return_catalog);
+        assert!(t3_opts.return_rotation_matrix);
+        assert!(t3_opts.return_best_failed_match);
+        assert_eq!(t3_opts.allow_out_of_bounds_target_pixel, Some(true));
+        assert_eq!(t3_opts.observer_latitude, Some(41.5));
+        assert_eq!(t3_opts.observer_lst, Some(32.0));
+        assert_eq!(t3_opts.min_boresight_altitude, Some(-2.5));
+    }
+
+    #[test]
+    fn test_map_solve_options_defaults() {
+        let proto_opts = proto::SolveOptions::default();
+        let t3_opts = map_solve_options(proto_opts);
+
+        assert_eq!(t3_opts.fov_estimate, None);
+        assert_eq!(t3_opts.return_best_failed_match, false);
+        assert_eq!(t3_opts.allow_out_of_bounds_target_pixel, None);
+        assert_eq!(t3_opts.observer_latitude, None);
+        assert_eq!(t3_opts.observer_lst, None);
+        assert_eq!(t3_opts.min_boresight_altitude, None);
     }
 }

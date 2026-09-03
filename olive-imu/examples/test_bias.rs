@@ -1,4 +1,4 @@
-// Required Notice: Copyright (c) 2026 Omair Kamil
+// Copyright (c) 2026 Omair Kamil
 // See LICENSE file in root directory for license terms.
 
 //! `test_bias` is a CLI diagnostic tool for analyzing IMU sensor drift.
@@ -11,7 +11,9 @@
 
 use std::time::Duration;
 
-use olive_imu::{Imu, bmi160::Bmi160Device, bno085::Bno085Device};
+use olive_imu::{
+    Imu, bmi160::Bmi160Device, bno055::Bno055Device, bno085::Bno085Device, mpuxxxx::MpuXxxxDevice,
+};
 use pico_args::Arguments;
 
 #[tokio::main]
@@ -30,8 +32,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut imu_engine = None;
 
+    // Try BNO085 at 0x4B on bus 3
+    if let Ok(device) = Bno085Device::new(10, 0x4B, use_calibrated, Some(3)) {
+        if let Ok(engine) = Imu::start(device, None) {
+            println!("BNO085 successfully initialized at 0x4B!");
+            imu_engine = Some(engine);
+        }
+    }
+
+    // Try BNO085 at 0x4A on bus 3
+    if imu_engine.is_none() {
+        if let Ok(device) = Bno085Device::new(10, 0x4A, use_calibrated, Some(3)) {
+            if let Ok(engine) = Imu::start(device, None) {
+                println!("BNO085 successfully initialized at 0x4A!");
+                imu_engine = Some(engine);
+            }
+        }
+    }
+
     // Try BNO085 at 0x4B
-    if let Ok(device) = Bno085Device::new(10, 0x4B, use_calibrated) {
+    if let Ok(device) = Bno085Device::new(10, 0x4B, use_calibrated, None) {
         if let Ok(engine) = Imu::start(device, None) {
             println!("BNO085 successfully initialized at 0x4B!");
             imu_engine = Some(engine);
@@ -40,9 +60,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Try BNO085 at 0x4A
     if imu_engine.is_none() {
-        if let Ok(device) = Bno085Device::new(10, 0x4A, use_calibrated) {
+        if let Ok(device) = Bno085Device::new(10, 0x4A, use_calibrated, None) {
             if let Ok(engine) = Imu::start(device, None) {
                 println!("BNO085 successfully initialized at 0x4A!");
+                imu_engine = Some(engine);
+            }
+        }
+    }
+
+    // Try BNO055 at 0x28
+    if imu_engine.is_none() {
+        if let Ok(device) = Bno055Device::new(10, 0x28) {
+            if let Ok(engine) = Imu::start(device, None) {
+                println!("BNO055 successfully initialized at 0x28!");
+                imu_engine = Some(engine);
+            }
+        }
+    }
+
+    // Try BNO055 at 0x29
+    if imu_engine.is_none() {
+        if let Ok(device) = Bno055Device::new(10, 0x29) {
+            if let Ok(engine) = Imu::start(device, None) {
+                println!("BNO055 successfully initialized at 0x29!");
                 imu_engine = Some(engine);
             }
         }
@@ -63,6 +103,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(device) = Bmi160Device::new(0x69) {
             if let Ok(engine) = Imu::start(device, None) {
                 println!("BMI160 successfully initialized at 0x69!");
+                imu_engine = Some(engine);
+            }
+        }
+    }
+
+    // Try MPUXXXX at 0x68
+    if imu_engine.is_none() {
+        if let Ok(device) = MpuXxxxDevice::new(10, 0x68) {
+            if let Ok(engine) = Imu::start(device, None) {
+                println!("MPUXXXX successfully initialized at 0x68!");
+                imu_engine = Some(engine);
+            }
+        }
+    }
+
+    // Try MPUXXXX at 0x69
+    if imu_engine.is_none() {
+        if let Ok(device) = MpuXxxxDevice::new(10, 0x69) {
+            if let Ok(engine) = Imu::start(device, None) {
+                println!("MPUXXXX successfully initialized at 0x69!");
                 imu_engine = Some(engine);
             }
         }
@@ -161,11 +221,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Metric 3: EMA Baseline
                         // The dynamic alpha rolling window that perfectly balances short-term noise rejection with long-term drift tracking.
 
+                        let accel_str = if let Some(update) = engine.get_latest_state() {
+                            if let Some(accel) = update.gravity_vector {
+                                let mag = (accel.x * accel.x + accel.y * accel.y + accel.z * accel.z).sqrt();
+                                format!("[{:.5}, {:.5}, {:.5}] ({:.2} m/s^2)", accel.x, accel.y, accel.z, mag)
+                            } else {
+                                "None".to_string()
+                            }
+                        } else {
+                            "None".to_string()
+                        };
+
+                        let quat_str = if let Some(update) = engine.get_latest_state() {
+                            if let Some(q) = update.hardware_quaternion {
+                                format!("[w:{:.3}, i:{:.3}, j:{:.3}, k:{:.3}]", q.w, q.i, q.j, q.k)
+                            } else {
+                                "None".to_string()
+                            }
+                        } else {
+                            "None".to_string()
+                        };
+
                         println!(
-                            "Current window: [{:.5}, {:.5}, {:.5}] | EMA baseline: [{:.5}, {:.5}, {:.5}] | Strict Cumulative: [{:.5}, {:.5}, {:.5}] ({} total samples)",
+                            "Gyro Window: [{:.5}, {:.5}, {:.5}] | Gyro EMA: [{:.5}, {:.5}, {:.5}] | Gyro Strict: [{:.5}, {:.5}, {:.5}] | Accel EMA: {} | HW Quat: {} ({} samples)",
                             current_bias.0, current_bias.1, current_bias.2,
                             ema_bias.0, ema_bias.1, ema_bias.2,
-                            strict_bias.0, strict_bias.1, strict_bias.2, total_samples
+                            strict_bias.0, strict_bias.1, strict_bias.2,
+                            accel_str,
+                            quat_str,
+                            total_samples
                         );
                     }
 

@@ -10,27 +10,10 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipWriter};
-
-static RAYON_INIT: Once = Once::new();
-
-fn init_rayon_thread_pool() {
-    RAYON_INIT.call_once(|| {
-        let num_threads = std::env::var("RAYON_NUM_THREADS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4); // Default to 4 threads
-
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .build_global()
-            .ok(); // Ignore if already initialized (though Once ensures it only runs once)
-    });
-}
 
 use cedar_detect::algorithm::{estimate_noise_from_image, get_stars_from_image};
 use tetra3::fast_extractor::{
@@ -456,7 +439,6 @@ fn run_validation_suite_from_fixtures(
 
 #[test]
 fn test_extraction_against_python_sanity() {
-    init_rayon_thread_pool();
     // Tests only the default extraction modes to ensure the base path works against fixtures.
     let bg_modes = [(Some(tetra3::extractor::BgSubMode::LocalMean), "local_mean")];
     let sigma_modes = [(
@@ -543,7 +525,6 @@ fn test_extraction_against_python_sanity() {
 
 #[test]
 fn test_extraction_against_python_full() {
-    init_rayon_thread_pool();
     // Tests all permutations of background subtraction, sigma thresholding, and downsampling.
     let bg_modes = [
         (
@@ -904,7 +885,6 @@ fn run_validation_suite_u8(
 
 #[test]
 fn test_extraction_u8_sanity() {
-    init_rayon_thread_pool();
     let bg_modes = [(Some(tetra3::extractor::BgSubMode::LocalMean), "local_mean")];
     let sigma_modes = [(
         tetra3::extractor::SigmaMode::GlobalRootSquare,
@@ -990,7 +970,6 @@ fn test_extraction_u8_sanity() {
 
 #[test]
 fn test_extraction_u8_full() {
-    init_rayon_thread_pool();
     let bg_modes = [
         (
             Some(tetra3::extractor::BgSubMode::LocalMedian),
@@ -1037,7 +1016,6 @@ fn test_extraction_u8_full() {
 // Run intentionally via: cargo test generate_python_test_fixtures --release -- --ignored --nocapture
 // This test requires the tetra3 module to be loaded in the Python environment
 fn generate_python_test_fixtures() {
-    init_rayon_thread_pool();
     let bg_modes = [
         (
             Some(tetra3::extractor::BgSubMode::LocalMedian),
@@ -1202,7 +1180,6 @@ fn generate_python_test_fixtures() {
 // Run intentionally via: cargo test test_performance_vs_python --release -- --ignored
 // This test requires the tetra3 module to be loaded in the Python environment
 fn test_performance_vs_python() {
-    init_rayon_thread_pool();
     let mut total_rust_time = Duration::ZERO;
     let mut total_rust_u8_time = Duration::ZERO;
     let mut total_py_time = Duration::ZERO;
@@ -1330,7 +1307,6 @@ fn test_performance_vs_python() {
 #[test]
 #[ignore]
 fn test_performance_vs_cedar() {
-    init_rayon_thread_pool();
     let iterations = 50;
     let image_paths = get_test_images();
     let downsamples = [None, Some(2), Some(4)];
@@ -1349,6 +1325,7 @@ fn test_performance_vs_cedar() {
         let options = ExtractOptions {
             downsample: ds_opt,
             return_images: false,
+            bg_sub_mode: Some(tetra3::extractor::BgSubMode::GlobalMean),
             ..Default::default()
         };
 
@@ -1505,7 +1482,6 @@ struct TableRow {
 #[test]
 #[ignore]
 fn test_grayscale_vs_cedar() {
-    init_rayon_thread_pool();
     let db_path = Path::new("tests/fixtures/default_database.npz");
     if !db_path.exists() {
         eprintln!("Skipping test: default_database.npz not found.");
@@ -1608,7 +1584,7 @@ fn test_grayscale_vs_cedar() {
         };
         let mut fast_extractor = FastExtractor::new(w as usize, h as usize, fe_options);
         let fast_u8_result = fast_extractor.extract(&rust_input_img_u8);
-        let fast_u8_count = fast_u8_result.len();
+        let fast_u8_count = fast_u8_result.centroids.len();
 
         // Run Port f32 (Original f32)
         let port_f32_result = tetra_extractor.extract(&rust_input_img_f32, options.clone());
@@ -1634,7 +1610,7 @@ fn test_grayscale_vs_cedar() {
         let u8_solve_str = format_solve!(u8_solve_res);
 
         // Solve Fast u8
-        let fast_u8_cents_arr = to_array!(&fast_u8_result, y, x);
+        let fast_u8_cents_arr = to_array!(&fast_u8_result.centroids, y, x);
         let fast_u8_solve_res = solver.solve(
             &fast_u8_cents_arr,
             (h as f64, w as f64),
@@ -1662,7 +1638,7 @@ fn test_grayscale_vs_cedar() {
 
         // Calculate top 4 Matches against Cedar
         let match_str_u8 = compare_top4!(&port_u8_result.centroids, &cedar_result.0);
-        let match_str_fast_u8 = compare_top4!(&fast_u8_result, &cedar_result.0);
+        let match_str_fast_u8 = compare_top4!(&fast_u8_result.centroids, &cedar_result.0);
 
         table_rows.push(TableRow {
             img_name,
@@ -1742,7 +1718,6 @@ struct ExtractorComparisonRow {
 
 #[test]
 fn test_fast_extractor_vs_others() {
-    init_rayon_thread_pool();
     let db_path = std::path::Path::new("tests/fixtures/default_database.npz");
     if !db_path.exists() {
         eprintln!("Skipping test: default_database.npz not found.");
@@ -1829,7 +1804,7 @@ fn test_fast_extractor_vs_others() {
         let t0 = std::time::Instant::now();
         let res_fast = fast_extractor.extract(&rust_input_img_u8);
         let fast_extractor_time = t0.elapsed();
-        let fast_extractor_count = res_fast.len();
+        let fast_extractor_count = res_fast.centroids.len();
 
         // Fast Extractor with Block Median
         let opt_block = FastExtractOptions {
@@ -1841,7 +1816,7 @@ fn test_fast_extractor_vs_others() {
         let t0 = std::time::Instant::now();
         let res_block = block_extractor.extract(&rust_input_img_u8);
         let block_median_time = t0.elapsed();
-        let block_median_count = res_block.len();
+        let block_median_count = res_block.centroids.len();
 
         let global_cents_arr = to_array!(&res_global.centroids, y, x);
         let global_solve_res = solver.solve(
@@ -1859,7 +1834,7 @@ fn test_fast_extractor_vs_others() {
         );
         let local_solve_str = format_solve!(local_solve_res);
 
-        let fast_cents_arr = to_array!(&res_fast, y, x);
+        let fast_cents_arr = to_array!(&res_fast.centroids, y, x);
         let fast_solve_res = solver.solve(
             &fast_cents_arr,
             (h as f64, w as f64),
@@ -1867,7 +1842,7 @@ fn test_fast_extractor_vs_others() {
         );
         let fast_solve_str = format_solve!(fast_solve_res);
 
-        let block_cents_arr = to_array!(&res_block, y, x);
+        let block_cents_arr = to_array!(&res_block.centroids, y, x);
         let block_solve_res = solver.solve(
             &block_cents_arr,
             (h as f64, w as f64),
@@ -1943,7 +1918,6 @@ fn test_fast_extractor_vs_others() {
 #[test]
 #[ignore]
 fn test_benchmark_bg_sub_modes() {
-    init_rayon_thread_pool();
     let iterations = 1000;
     let image_paths = get_test_images();
     let downsamples = [FastDownsample::None, FastDownsample::X2, FastDownsample::X4];
@@ -2009,7 +1983,7 @@ fn test_benchmark_bg_sub_modes() {
                 let mut total_time_seq = Duration::ZERO;
                 for _ in 0..iterations {
                     let start = Instant::now();
-                    let _res = extractor_seq.extract_sequential(&input_img);
+                    let _res = extractor_seq.extract(&input_img);
                     total_time_seq += start.elapsed();
                 }
                 let avg_time_seq = total_time_seq / iterations as u32;
@@ -2024,7 +1998,6 @@ fn test_benchmark_bg_sub_modes() {
 
 #[test]
 fn test_fast_extractor_accuracy() {
-    init_rayon_thread_pool();
     let image_paths = get_test_images();
 
     // Test on 3 diverse images to keep the test fast but representative
@@ -2100,9 +2073,13 @@ fn test_fast_extractor_accuracy() {
                             FastExtractor::new(w as usize, h as usize, fast_options.clone());
                         let fast_res = fast_extractor.extract(&input_img);
 
-                        let mut fast_extractor_seq =
-                            FastExtractor::new(w as usize, h as usize, fast_options.clone());
-                        let fast_res_seq = fast_extractor_seq.extract_sequential(&input_img);
+                        let mut fast_options_bg_approx = fast_options.clone();
+                        fast_options_bg_approx.approximate_background = true;
+
+                        let mut fast_extractor_bg_approximation =
+                            FastExtractor::new(w as usize, h as usize, fast_options_bg_approx);
+                        let fast_res_bg_approximation =
+                            fast_extractor_bg_approximation.extract(&input_img);
 
                         let mut b_sorted = base_res.centroids.clone();
                         b_sorted.sort_by(|a, b| {
@@ -2112,7 +2089,7 @@ fn test_fast_extractor_accuracy() {
                         });
 
                         let mut f_sorted = fast_res.clone();
-                        f_sorted.sort_by(|a, b| {
+                        f_sorted.centroids.sort_by(|a, b| {
                             a.y.partial_cmp(&b.y)
                                 .unwrap()
                                 .then(a.x.partial_cmp(&b.x).unwrap())
@@ -2120,7 +2097,7 @@ fn test_fast_extractor_accuracy() {
 
                         assert_eq!(
                             base_res.centroids.len(),
-                            fast_res.len(),
+                            fast_res.centroids.len(),
                             "Mismatch in number of centroids extracted for {:?}",
                             path
                         );
@@ -2128,7 +2105,7 @@ fn test_fast_extractor_accuracy() {
                         // Ensure parallel fast extraction aligns with base extractor 100%
                         let mut matched_fast = 0;
                         for b in &base_res.centroids {
-                            for f in &fast_res {
+                            for f in &fast_res.centroids {
                                 let dist = ((b.x - f.x).powi(2) + (b.y - f.y).powi(2)).sqrt();
                                 if dist < 0.5 {
                                     // Fairly strict tolerance
@@ -2167,7 +2144,7 @@ fn test_fast_extractor_accuracy() {
 
                         let mut matched = 0;
                         for b in &base_res.centroids {
-                            for f_seq in &fast_res_seq {
+                            for f_seq in &fast_res_bg_approximation.centroids {
                                 let dist =
                                     ((b.x - f_seq.x).powi(2) + (b.y - f_seq.y).powi(2)).sqrt();
                                 if dist < 1.5 {
@@ -2193,7 +2170,6 @@ fn test_fast_extractor_accuracy() {
 
 #[test]
 fn test_non_contiguous_and_crops_no_panic() {
-    init_rayon_thread_pool();
     let mut extractor = tetra3::extractor::Extractor::new();
 
     // Create a 100x100 f32 image and u8 image
@@ -2223,16 +2199,19 @@ fn test_non_contiguous_and_crops_no_panic() {
 
     let mut fast_extractor =
         tetra3::fast_extractor::FastExtractor::new(100, 100, fast_options.clone());
-    let mut fast_extractor_seq =
-        tetra3::fast_extractor::FastExtractor::new(100, 100, fast_options.clone());
+    let mut fast_options_bg_approx = fast_options.clone();
+    fast_options_bg_approx.approximate_background = true;
+
+    let mut fast_extractor_bg_approximation =
+        tetra3::fast_extractor::FastExtractor::new(100, 100, fast_options_bg_approx);
 
     // Test 1: Standard layout (C-contiguous)
     extractor.extract(&img_f32, options.clone());
     extractor.extract_u8(&img_u8, options.clone());
     fast_extractor.extract_f32(&img_f32);
     fast_extractor.extract(&img_u8);
-    fast_extractor_seq.extract_sequential_f32(&img_f32);
-    fast_extractor_seq.extract_sequential(&img_u8);
+    fast_extractor_bg_approximation.extract_f32(&img_f32);
+    fast_extractor_bg_approximation.extract(&img_u8);
 
     // Test 2: Non-standard layout (Transposed -> Fortran layout)
     let transposed_f32 = img_f32.t();
@@ -2242,8 +2221,8 @@ fn test_non_contiguous_and_crops_no_panic() {
     extractor.extract_u8(&transposed_u8, options.clone());
     fast_extractor.extract_f32(&transposed_f32);
     fast_extractor.extract(&transposed_u8);
-    fast_extractor_seq.extract_sequential_f32(&transposed_f32);
-    fast_extractor_seq.extract_sequential(&transposed_u8);
+    fast_extractor_bg_approximation.extract_f32(&transposed_f32);
+    fast_extractor_bg_approximation.extract(&transposed_u8);
 
     // Test 3: Sliced with step (Non-contiguous rows and columns)
     let sliced_f32 = img_f32.slice(ndarray::s![..;2, ..;2]);
@@ -2268,13 +2247,355 @@ fn test_non_contiguous_and_crops_no_panic() {
 
     let mut fast_extractor_sliced =
         tetra3::fast_extractor::FastExtractor::new(50, 50, fast_options_sliced.clone());
-    let mut fast_extractor_seq_sliced =
-        tetra3::fast_extractor::FastExtractor::new(50, 50, fast_options_sliced.clone());
+    let mut fast_options_sliced_bg = fast_options_sliced.clone();
+    fast_options_sliced_bg.approximate_background = true;
+
+    let mut fast_extractor_bg_approximation_sliced =
+        tetra3::fast_extractor::FastExtractor::new(50, 50, fast_options_sliced_bg);
 
     extractor.extract(&sliced_f32, options_sliced.clone());
     extractor.extract_u8(&sliced_u8, options_sliced.clone());
     fast_extractor_sliced.extract_f32(&sliced_f32);
     fast_extractor_sliced.extract(&sliced_u8);
-    fast_extractor_seq_sliced.extract_sequential_f32(&sliced_f32);
-    fast_extractor_seq_sliced.extract_sequential(&sliced_u8);
+    fast_extractor_bg_approximation_sliced.extract_f32(&sliced_f32);
+    fast_extractor_bg_approximation_sliced.extract(&sliced_u8);
+}
+
+#[test]
+#[ignore]
+fn test_performance_approx_vs_exact() {
+    let iterations = 50;
+    let image_paths = get_test_images();
+
+    let downsamples = [
+        tetra3::fast_extractor::FastDownsample::None,
+        tetra3::fast_extractor::FastDownsample::X2,
+        tetra3::fast_extractor::FastDownsample::X4,
+    ];
+
+    let bg_modes = [
+        None,
+        Some(tetra3::fast_extractor::FastBgSubMode::GlobalMean),
+        Some(tetra3::fast_extractor::FastBgSubMode::GlobalMedian),
+        Some(tetra3::fast_extractor::FastBgSubMode::BlockMedian { block_size: 64 }),
+        Some(tetra3::fast_extractor::FastBgSubMode::LineMedian),
+    ];
+
+    #[derive(Debug)]
+    struct PerfRow {
+        ds: tetra3::fast_extractor::FastDownsample,
+        bg_mode_str: String,
+        exact_time: Duration,
+        approx_time: Duration,
+    }
+
+    let mut results = Vec::new();
+
+    // Preload images
+    let mut preloaded = Vec::new();
+    for path in &image_paths {
+        let base_img = image::open(path).unwrap();
+        let luma_img = base_img.to_luma8();
+        let (w, h) = luma_img.dimensions();
+        let mut input_img_u8 = ndarray::Array2::<u8>::zeros((h as usize, w as usize));
+        for y in 0..h {
+            for x in 0..w {
+                input_img_u8[[y as usize, x as usize]] = luma_img.get_pixel(x, y)[0];
+            }
+        }
+        preloaded.push((input_img_u8, w, h));
+    }
+
+    println!(
+        "Running {} iterations for exact vs approx performance...",
+        iterations
+    );
+
+    for &ds in &downsamples {
+        for &bg_mode in &bg_modes {
+            let mut total_exact = Duration::ZERO;
+            let mut total_approx = Duration::ZERO;
+
+            for (img, w, h) in &preloaded {
+                let exact_opts = tetra3::fast_extractor::FastExtractOptions {
+                    downsample: ds,
+                    bg_sub_mode: bg_mode,
+                    approximate_background: false,
+                    ..Default::default()
+                };
+                let approx_opts = tetra3::fast_extractor::FastExtractOptions {
+                    downsample: ds,
+                    bg_sub_mode: bg_mode,
+                    approximate_background: true,
+                    ..Default::default()
+                };
+
+                let mut exact_ext = tetra3::fast_extractor::FastExtractor::new(
+                    *w as usize,
+                    *h as usize,
+                    exact_opts,
+                );
+                let mut approx_ext = tetra3::fast_extractor::FastExtractor::new(
+                    *w as usize,
+                    *h as usize,
+                    approx_opts,
+                );
+
+                for _ in 0..iterations {
+                    let start = std::time::Instant::now();
+                    std::hint::black_box(exact_ext.extract(img));
+                    total_exact += start.elapsed();
+
+                    let start = std::time::Instant::now();
+                    std::hint::black_box(approx_ext.extract(img));
+                    total_approx += start.elapsed();
+                }
+            }
+
+            let bg_mode_str = match bg_mode {
+                None => "None".to_string(),
+                Some(m) => format!("{:?}", m),
+            };
+
+            results.push(PerfRow {
+                ds,
+                bg_mode_str,
+                exact_time: total_exact,
+                approx_time: total_approx,
+            });
+        }
+    }
+
+    println!(
+        "\n{:<12} | {:<32} | {:<25} | {:<25}",
+        "Downsample", "Background Sub Mode", "Precise Background", "Approximate Background"
+    );
+    println!("{:-<103}", "");
+
+    // Results are already sorted by downsample then bg sub mode due to iteration order
+    for row in results {
+        println!(
+            "{:<12} | {:<32} | {:<25.2?} | {:<25.2?}",
+            format!("{:?}", row.ds),
+            row.bg_mode_str,
+            row.exact_time,
+            row.approx_time
+        );
+    }
+}
+
+#[test]
+fn test_virtual_crops_with_base_crop() {
+    let image_paths = get_test_images();
+    let path = &image_paths[0];
+    let img = image::open(path).unwrap().to_luma8();
+    let (w, h) = img.dimensions();
+
+    // We only test if the image is reasonably large
+    if w < 1000 || h < 1000 {
+        return;
+    }
+
+    let mut input_img = Array2::<f32>::zeros((h as usize, w as usize));
+    for y in 0..h {
+        for x in 0..w {
+            input_img[[y as usize, x as usize]] = img.get_pixel(x, y)[0] as f32;
+        }
+    }
+
+    // 1. Define a base crop in the center
+    let base_crop_w = 800;
+    let base_crop_h = 800;
+
+    // 2. Define virtual crops relative to the FULL original dimensions (w x h).
+    // Let's make a top-left virtual crop and a bottom-right virtual crop.
+    let vc_w = 400;
+    let vc_h = 400;
+
+    // Top-left is at offset_y: -h/2 + vc_h/2, offset_x: -w/2 + vc_w/2
+    // Bottom-right is at offset_y: h/2 - vc_h/2, offset_x: w/2 - vc_w/2
+    // But it's easier to use Crop::Region with absolute coordinates mapping.
+    // tetra3::Crop::Region expects offset from center!
+
+    let offset_y_tl = -((h as isize - vc_h as isize) / 2);
+    let offset_x_tl = -((w as isize - vc_w as isize) / 2);
+
+    let offset_y_br = (h as isize - vc_h as isize) / 2;
+    let offset_x_br = (w as isize - vc_w as isize) / 2;
+
+    let virtual_crops = vec![
+        tetra3::Crop::Region {
+            width: vc_w,
+            height: vc_h,
+            offset_x: offset_x_tl,
+            offset_y: offset_y_tl,
+        },
+        tetra3::Crop::Region {
+            width: vc_w,
+            height: vc_h,
+            offset_x: offset_x_br,
+            offset_y: offset_y_br,
+        },
+    ];
+
+    let options = FastExtractOptions {
+        crop: Some((base_crop_w, base_crop_h)),
+        virtual_crops: Some(virtual_crops.clone()),
+        ..Default::default()
+    };
+
+    let mut extractor = FastExtractor::new(h as usize, w as usize, options);
+    let result = extractor.extract_f32(&input_img);
+
+    // The base crop (800x800) is in the center of the image.
+    // The Top-Left virtual crop (400x400) is in the top-left of the 1920x1080 image.
+    // Do they intersect?
+    // Center is [h/2 - 400, h/2 + 400] and [w/2 - 400, w/2 + 400].
+    // Top-Left is [0, 400] and [0, 400].
+    // For a 1920x1080 image, center is [140, 940] and [560, 1360].
+    // TL [0, 400] intersect center [140, 940] -> yes! from 140 to 400.
+
+    let v_centroids = result
+        .virtual_crop_centroids
+        .expect("Expected virtual crop centroids");
+    assert_eq!(v_centroids.len(), 2);
+
+    let (y_min_0, y_max_0, x_min_0, x_max_0) = virtual_crops[0].bounds(w as usize, h as usize);
+    let (y_min_1, y_max_1, x_min_1, x_max_1) = virtual_crops[1].bounds(w as usize, h as usize);
+
+    for c in &v_centroids[0] {
+        assert!(
+            c.y >= y_min_0 as f64 && c.y < y_max_0 as f64,
+            "Top-left Y out of bounds: {} not in [{}, {})",
+            c.y,
+            y_min_0,
+            y_max_0
+        );
+        assert!(
+            c.x >= x_min_0 as f64 && c.x < x_max_0 as f64,
+            "Top-left X out of bounds: {} not in [{}, {})",
+            c.x,
+            x_min_0,
+            x_max_0
+        );
+    }
+
+    for c in &v_centroids[1] {
+        assert!(
+            c.y >= y_min_1 as f64 && c.y < y_max_1 as f64,
+            "Bottom-right Y out of bounds: {} not in [{}, {})",
+            c.y,
+            y_min_1,
+            y_max_1
+        );
+        assert!(
+            c.x >= x_min_1 as f64 && c.x < x_max_1 as f64,
+            "Bottom-right X out of bounds: {} not in [{}, {})",
+            c.x,
+            x_min_1,
+            x_max_1
+        );
+    }
+}
+
+#[test]
+fn test_fast_extractor_variants() {
+    use tetra3::fast_extractor::{FastExtractOptions, FastExtractOptionsUpdate, FastExtractor};
+
+    // Grab the first test image
+    let image_paths = get_test_images();
+    let img_path = &image_paths[0];
+
+    // Load as u8
+    let img = image::open(img_path).unwrap().into_luma8();
+    let (w, h) = img.dimensions();
+    let image_array = Array2::from_shape_vec((h as usize, w as usize), img.into_raw()).unwrap();
+
+    let base_options = FastExtractOptions {
+        sigma: 3.0,
+        downsample: FastDownsample::None,
+        bg_sub_mode: Some(FastBgSubMode::GlobalMedian),
+        sigma_mode: FastSigmaMode::GlobalMedianAbs,
+        ..Default::default()
+    };
+
+    let mut extractor = FastExtractor::new(w as usize, h as usize, base_options.clone());
+
+    // 1. Run via variants API
+    let variants = vec![
+        FastExtractOptionsUpdate {
+            sigma: Some(5.0),
+            min_area: Some(1),
+            ..Default::default()
+        },
+        FastExtractOptionsUpdate {
+            sigma: Some(3.0),
+            min_area: Some(2),
+            ..Default::default()
+        },
+    ];
+
+    let batch_results = extractor.extract_variants(&image_array, &variants);
+    assert_eq!(batch_results.len(), 2);
+
+    // 2. Run individually using standard update_options and extract
+    let mut extractor1 = FastExtractor::new(w as usize, h as usize, base_options.clone());
+    extractor1.update_options(variants[0].clone());
+    let res1 = extractor1.extract(&image_array);
+
+    let mut extractor2 = FastExtractor::new(w as usize, h as usize, base_options.clone());
+    extractor2.update_options(variants[1].clone());
+    let res2 = extractor2.extract(&image_array);
+
+    // 3. Compare lengths
+    assert_eq!(
+        batch_results[0].centroids.len(),
+        res1.centroids.len(),
+        "Variant 0 centroid count mismatch"
+    );
+    assert_eq!(
+        batch_results[1].centroids.len(),
+        res2.centroids.len(),
+        "Variant 1 centroid count mismatch"
+    );
+
+    // 4. Compare exact centroid matches
+    for (b_c, r_c) in batch_results[0].centroids.iter().zip(res1.centroids.iter()) {
+        assert_eq!(b_c.x, r_c.x, "Variant 0 x mismatch");
+        assert_eq!(b_c.y, r_c.y, "Variant 0 y mismatch");
+        assert_eq!(b_c.sum, r_c.sum, "Variant 0 sum mismatch");
+        assert_eq!(b_c.area, r_c.area, "Variant 0 area mismatch");
+    }
+
+    for (b_c, r_c) in batch_results[1].centroids.iter().zip(res2.centroids.iter()) {
+        assert_eq!(b_c.x, r_c.x, "Variant 1 x mismatch");
+        assert_eq!(b_c.y, r_c.y, "Variant 1 y mismatch");
+        assert_eq!(b_c.sum, r_c.sum, "Variant 1 sum mismatch");
+        assert_eq!(b_c.area, r_c.area, "Variant 1 area mismatch");
+    }
+
+    // 5. Check background level
+    assert!(batch_results[0].background_level >= 0.0);
+    assert!(batch_results[1].background_level >= 0.0);
+    assert_eq!(
+        batch_results[0].background_level,
+        batch_results[1].background_level
+    );
+
+    // 6. Check empty variants short circuit
+    let empty_results = extractor.extract_variants(&image_array, &[]);
+    assert_eq!(empty_results.len(), 0);
+
+    // 7. Check f32 images
+    let mut image_array_f32 = Array2::<f32>::zeros((h as usize, w as usize));
+    for ((y, x), val) in image_array.indexed_iter() {
+        image_array_f32[[y, x]] = *val as f32;
+    }
+    let mut f32_extractor = FastExtractor::new(w as usize, h as usize, base_options.clone());
+    let f32_batch_results = f32_extractor.extract_variants_f32(&image_array_f32, &variants);
+    assert_eq!(f32_batch_results.len(), 2);
+    assert_eq!(f32_batch_results[0].centroids.len(), res1.centroids.len());
+
+    let empty_results_f32 = f32_extractor.extract_variants_f32(&image_array_f32, &[]);
+    assert_eq!(empty_results_f32.len(), 0);
 }

@@ -65,6 +65,25 @@ Extracts star centroids from a 2D NumPy array using zero-copy memory access.
 
 ---
 
+### `get_centroids_from_image_fast(image, **kwargs)`
+Extracts star centroids using the zero-allocation fast extraction path. Accepts either `uint8` or `float32` 2D NumPy arrays.
+
+**Arguments:**
+* **`image`** *(numpy.ndarray)*: A 2D array (`uint8` or `float32`).
+* **`**kwargs`**: Fast extraction options:
+  * `sigma` *(float)*: Multiplier for background noise threshold.
+  * `downsample` *(int)*: Downsampling factor (`1`, `2`, or `4`).
+  * `bg_sub_mode` *(str)*: `"global_mean"`, `"global_median"`, `"block_median"`, or `"line_median"`.
+  * `filtsize` *(int)*: Block size when using `"block_median"`.
+  * `binary_open` *(bool)*: Whether to apply binary morphological opening filter.
+  * `min_area` / `max_area` *(int)*: Minimum/maximum component pixel area.
+  * `virtual_crops` *(list)*: Optional list of crop dictionaries for multi-region extraction.
+
+**Returns:**
+* **`numpy.ndarray`**: `(N, 2)` array containing `[y, x]` centroid coordinates, or a tuple containing base centroids and virtual crop centroids if `virtual_crops` were specified.
+
+---
+
 ### `solve_from_centroids(centroids, size, **kwargs)`
 Runs plate solving from pre-extracted centroids.
 
@@ -97,8 +116,20 @@ Runs plate solving from pre-extracted centroids.
 
 ---
 
+### `solve_from_image_fast(image, **kwargs)`
+Executes the fast-path extraction and immediate plate solve in an uninterrupted native execution flow. Accepts `uint8` or `float32` image arrays.
+
+**Arguments:**
+* **`image`** *(numpy.ndarray)*: A 2D array (`uint8` or `float32`).
+* **`**kwargs`**: Combined configuration keys for fast extraction and solving.
+
+**Returns:**
+* **`dict`**: Solution dictionary identical to `solve_from_centroids`, with `'T_extract'` recording fast extraction time in ms.
+
+---
+
 ### `solve_from_image(image, **kwargs)`
-Runs both extraction and plate solving in one uninterrupted, native pipeline.
+Runs both standard extraction and plate solving in one uninterrupted, native pipeline.
 
 **Arguments:**
 * **`image`** *(numpy.ndarray)*: A 2D array of `float32`.

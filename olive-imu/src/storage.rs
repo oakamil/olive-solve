@@ -3,17 +3,41 @@
 
 use std::path::PathBuf;
 
+/// Interface for persisting IMU calibration parameters across reboots.
 pub trait PersistentStorage: Send + Sync {
+    /// Gets a value from storage by key.
     fn get(&self, key: &str) -> Option<String>;
+    /// Sets a value in storage by key.
     fn set(&self, key: &str, value: &str);
+    /// Removes a value from storage by key.
     fn remove(&self, key: &str);
 }
 
+/// A no-op implementation of `PersistentStorage` that discards saved data.
+pub struct NullStorage;
+
+impl NullStorage {
+    /// Constructs a new `NullStorage`.
+    pub fn new() -> Self {
+        NullStorage
+    }
+}
+
+impl PersistentStorage for NullStorage {
+    fn get(&self, _key: &str) -> Option<String> {
+        None
+    }
+    fn set(&self, _key: &str, _value: &str) {}
+    fn remove(&self, _key: &str) {}
+}
+
+/// A file-based implementation of `PersistentStorage`.
 pub struct FileStorage {
     dir: PathBuf,
 }
 
 impl FileStorage {
+    /// Creates a new `FileStorage` in the specified directory.
     pub fn new(dir: PathBuf) -> Self {
         let _ = std::fs::create_dir_all(&dir);
         Self { dir }

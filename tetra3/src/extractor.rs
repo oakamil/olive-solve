@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Omair Kamil
 //
-// This file is a derivative work - a Python interface to the optimized Rust port
-// of the cedar-solve and esa/tetra3 projects. The original underlying code is
-// licensed under the Apache License, Version 2.0.
+// This file is a derivative work - an optimized Rust star centroid extractor
+// ported from the cedar-solve and esa/tetra3 projects. The original underlying
+// code is licensed under the Apache License, Version 2.0.
 // Original Copyright (c) European Space Agency, Steven Rosenthal, brownj4, and
 // contributors.
 //
@@ -64,58 +64,132 @@
 //    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //    SOFTWARE.
 
+//! Standard star centroid extraction pipeline ported from `cedar-solve` and `esa/tetra3`.
+//!
+//! Provides background subtraction (local/global mean and median), noise standard deviation
+//! estimation, thresholding, binary opening, connected-component analysis, and centroid moments.
+
 use ndarray::{Array2, ArrayBase, Data, Ix2, s};
 
 use std::cmp::Ordering;
 
+/// Specifies the background subtraction algorithm applied prior to star detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BgSubMode {
+    /// Local sliding window median subtraction (highest accuracy, highest computational cost).
     LocalMedian,
+    /// Local sliding window box mean subtraction.
     LocalMean,
+    /// Subtracts the scalar median value computed across the entire image.
     GlobalMedian,
+    /// Subtracts the scalar mean value computed across the entire image (fastest).
     GlobalMean,
 }
 
+/// Specifies the noise standard deviation (sigma) estimation algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SigmaMode {
+    /// Local median absolute deviation (MAD) estimating local noise floor across filtering window.
     LocalMedianAbs,
+    /// Local root-mean-square noise estimation.
     LocalRootSquare,
+    /// Global median absolute deviation (1.4826 * MAD) across the full frame.
     GlobalMedianAbs,
+    /// Global root-mean-square noise estimation.
     GlobalRootSquare,
 }
 
-#[derive(Debug, Clone)]
+/// Region cropping options applied to the input image prior to processing.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Crop {
     /// Scalar: Image is cropped to given fraction (e.g. 2 gives 1/2 size image out).
     Fraction(usize),
     /// 2-tuple: Image is cropped to centered region.
-    Center { height: usize, width: usize },
+    Center {
+        /// Height of the centered crop region in pixels.
+        height: usize,
+        /// Width of the centered crop region in pixels.
+        width: usize,
+    },
     /// 4-tuple: Image is cropped to region with an offset.
     Region {
+        /// Height of the crop region in pixels.
         height: usize,
+        /// Width of the crop region in pixels.
         width: usize,
+        /// Vertical offset from the image center in pixels (positive is down).
         offset_y: isize,
+        /// Horizontal offset from the image center in pixels (positive is right).
         offset_x: isize,
     },
 }
 
+impl Crop {
+    /// Returns the crop bounds `(y_min, y_max, x_min, x_max)` for a given original image size.
+    pub fn bounds(&self, orig_width: usize, orig_height: usize) -> (usize, usize, usize, usize) {
+        match self {
+            Crop::Fraction(f) => {
+                let h = orig_height / f;
+                let w = orig_width / f;
+                let oy = (orig_height.saturating_sub(h)) / 2;
+                let ox = (orig_width.saturating_sub(w)) / 2;
+                (oy, oy + h, ox, ox + w)
+            }
+            Crop::Center { height, width } => {
+                let oy = (orig_height.saturating_sub(*height)) / 2;
+                let ox = (orig_width.saturating_sub(*width)) / 2;
+                (oy, oy + *height, ox, ox + *width)
+            }
+            Crop::Region {
+                height,
+                width,
+                offset_y,
+                offset_x,
+            } => {
+                let cy = (orig_height / 2) as isize;
+                let cx = (orig_width / 2) as isize;
+                let oy = (cy + offset_y - (*height as isize) / 2).max(0) as usize;
+                let ox = (cx + offset_x - (*width as isize) / 2).max(0) as usize;
+                (oy, oy + *height, ox, ox + *width)
+            }
+        }
+    }
+}
+
+/// Configuration options controlling star centroid extraction.
 #[derive(Debug, Clone)]
 pub struct ExtractOptions {
+    /// Multiplier on the estimated noise standard deviation to determine the detection threshold.
     pub sigma: f32,
+    /// Optional fixed intensity threshold overriding the statistical sigma cutoff.
     pub image_th: Option<f32>,
+    /// Optional spatial crop applied to the raw image prior to extraction.
     pub crop: Option<Crop>,
+    /// Optional integer downsampling factor (e.g. 2 for 2x2 binning).
     pub downsample: Option<usize>,
+    /// Window size in pixels for sliding-window background and sigma filters.
     pub filtsize: usize,
+    /// Background subtraction method, or `None` to bypass subtraction.
     pub bg_sub_mode: Option<BgSubMode>,
+    /// Statistical method used to estimate the noise floor standard deviation.
     pub sigma_mode: SigmaMode,
+    /// If true, applies morphological binary opening (erosion followed by dilation) to reject single-pixel noise.
     pub binary_open: bool,
+    /// Window size in pixels around detection peaks for moment integration.
     pub centroid_window: Option<usize>,
+    /// Maximum allowable connected component area in pixels (rejects bloated artifacts).
     pub max_area: Option<usize>,
+    /// Minimum allowable connected component area in pixels (rejects spurious single-pixel noise).
     pub min_area: Option<usize>,
+    /// Maximum integrated flux / pixel sum for valid candidate stars.
     pub max_sum: Option<f64>,
+    /// Minimum integrated flux / pixel sum required for a candidate star.
     pub min_sum: Option<f64>,
+    /// Maximum major-to-minor axis ratio (rejects satellite streaks and elongated defects).
     pub max_axis_ratio: Option<f64>,
+    /// Maximum number of brightest star centroids to return.
     pub max_returned: Option<usize>,
+    /// If true, populates [`ExtractionResult::debug_images`] with intermediate arrays.
     pub return_images: bool,
 }
 
@@ -142,34 +216,50 @@ impl Default for ExtractOptions {
     }
 }
 
+/// Properties and spatial moments of an extracted star centroid.
 #[derive(Debug, Clone)]
 pub struct CentroidResult {
+    /// Sub-pixel vertical coordinate (row index, 0 at top).
     pub y: f64,
+    /// Sub-pixel horizontal coordinate (column index, 0 at left).
     pub x: f64,
+    /// Total integrated flux (sum of background-subtracted pixel intensities).
     pub sum: f64,
+    /// Connected component pixel area.
     pub area: usize,
+    /// Second central moment in horizontal (x) axis.
     pub m2_xx: f64,
+    /// Second central moment in vertical (y) axis.
     pub m2_yy: f64,
+    /// Mixed second central moment (xy).
     pub m2_xy: f64,
+    /// Major axis over minor axis ratio measuring blob roundness.
     pub axis_ratio: f64,
 }
 
+/// Intermediate image buffers captured during the extraction pipeline for debugging.
 #[derive(Debug, Clone)]
 pub struct DebugImages {
+    /// The input image after cropping and downsampling stages.
     pub cropped_and_downsampled: Array2<f32>,
+    /// Image after subtracting the calculated background field.
     pub removed_background: Array2<f32>,
+    /// Binary boolean mask indicating pixels that exceeded the detection threshold.
     pub binary_mask: Array2<bool>,
 }
 
+/// Result produced by star centroid extraction.
 #[derive(Debug, Clone)]
 pub struct ExtractionResult {
+    /// Detected star centroids sorted in descending order of integrated flux.
     pub centroids: Vec<CentroidResult>,
+    /// Diagnostic debug images, present when `ExtractOptions::return_images` is true.
     pub debug_images: Option<DebugImages>,
 }
 
-/// Trait to allow our highly optimized spatial filters to transparently operate
-/// on either `u8` (zero-copy ingestion) or `f32` (standard/downsampled modes)
+/// Trait to allow optimized spatial filters to operate transparently on `u8` or `f32` inputs.
 pub trait ToF32 {
+    /// Converts the source pixel type into an `f32` representation.
     fn to_f32(self) -> f32;
 }
 
@@ -576,6 +666,7 @@ impl Default for Extractor {
 }
 
 impl Extractor {
+    /// Creates a new `Extractor` instance with pre-allocated scratch buffers.
     pub fn new() -> Self {
         Self {
             image_vec: Vec::new(),

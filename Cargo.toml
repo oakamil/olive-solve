@@ -3,15 +3,25 @@ name = "olive-solve"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "olive_solve"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+python = ["dep:pyo3", "dep:numpy", "tetra3/python"]
+force-32bit-solver = ["tetra3/force-32bit-solver"]
+
 [dependencies]
+pyo3 = { version = "0.28.2", features = ["extension-module"], optional = true }
+numpy = { version = "0.28.0", optional = true }
 tetra3 = { path = "tetra3" }
 olive-imu = { path = "olive-imu" }
 bno080 = { git = "https://github.com/oakamil/bno080.git", branch = "arvr" }
 bmi160 = { git = "https://github.com/oakamil/bmi160-rs.git" }
-tokio = { version = "1.36", features = ["sync", "rt", "macros", "time"] }
+
 chrono = "0.4"
 log = "0.4"
-async-trait = "0.1"
+
 ndarray = "0.17.2"
 nalgebra = "0.32"
 
@@ -29,3 +39,7 @@ lto = "fat"            # Enables Link-Time Optimization across all dependency cr
 codegen-units = 1      # Compiles the whole program as a single unit for max optimization
 panic = "abort"        # Removes stack-unwinding overhead
 strip = true           # Strips debug symbols to reduce binary size and memory layout
+
+[dev-dependencies]
+serde_json = "1.0.151"
+zip = "8.6.0"

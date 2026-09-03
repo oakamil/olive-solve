@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright (c) 2026 Omair Kamil
+# See LICENSE file in root directory for license terms.
 # Unified Benchmark Script for Tetra3 Fast Path
 # This script builds the project in release mode and runs performance tests.
 

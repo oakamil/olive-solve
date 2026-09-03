@@ -6,14 +6,17 @@ edition = "2024"
 [dependencies]
 log = "0.4"
 nalgebra = "0.32"
-tokio = { version = "1.0", features = ["sync", "rt"] }
+
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-bno080 = { git = "https://github.com/oakamil/bno080.git", branch = "arvr" }
 bmi160 = { git = "https://github.com/oakamil/bmi160-rs.git" }
+bno055 = "0.4.0"
+bno080 = { git = "https://github.com/oakamil/bno080.git", branch = "arvr" }
+embedded-hal = "1.0.0"
 linux-embedded-hal = "0.4.0"
+mpu6050-driver = "0.1.1"
 
 [dev-dependencies]
-pico-args = "0.5.0"
 env_logger = "0.11"
+pico-args = "0.5.0"
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "signal", "time"] }

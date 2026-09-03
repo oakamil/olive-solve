@@ -147,8 +147,10 @@ fn test_mirrored_image_e2e_all_images() {
             continue;
         }
 
-        // Compare results (RA, Dec, Roll, FOV)
-        let epsilon = 1e-4;
+        #[cfg(not(feature = "force-32bit-solver"))]
+        let epsilon = 1e-4; // 0.0001 deg = 0.36 arcseconds (64-bit pipeline)
+        #[cfg(feature = "force-32bit-solver")]
+        let epsilon = 1e-2; // 0.01 deg = 36 arcseconds (32-bit pipeline)
 
         let ra1 = solve_res.ra.unwrap();
         let dec1 = solve_res.dec.unwrap();
