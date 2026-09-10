@@ -79,7 +79,7 @@ fn test_solver_consistency_with_testdata() {
         panic!("Fixture zip not found!");
     }
 
-    let mut solver = Solver::load_database(db_path).expect("Failed to load Tetra3 database");
+    let mut solver = Solver::load_database(&db_path).expect("Failed to load Tetra3 database");
 
     let zip_file = File::open(zip_path).expect("Failed to open solver_fixtures.zip");
     let mut archive = ZipArchive::new(zip_file).expect("Failed to open zip archive");
@@ -153,6 +153,7 @@ fn test_solver_consistency_with_testdata() {
             observer_lst: None,
             min_boresight_altitude: None,
             return_best_failed_match: false,
+            ..Default::default()
         };
 
         // --- Capture the execution time ---
@@ -288,7 +289,7 @@ fn test_solver_mirrored_image() {
         return;
     }
 
-    let mut solver = Solver::load_database(db_path).expect("Failed to load Tetra3 database");
+    let mut solver = Solver::load_database(&db_path).expect("Failed to load Tetra3 database");
 
     let zip_file = File::open(zip_path).expect("Failed to open solver_fixtures.zip");
     let mut archive = ZipArchive::new(zip_file).expect("Failed to open zip archive");
@@ -354,6 +355,7 @@ fn test_solver_mirrored_image() {
         observer_lst: None,
         min_boresight_altitude: None,
         return_best_failed_match: false,
+        ..Default::default()
     };
 
     let result = solver.solve(
@@ -410,7 +412,7 @@ fn test_true_matches_consistency() {
         return;
     }
 
-    let mut solver = Solver::load_database(db_path).expect("Failed to load Tetra3 database");
+    let mut solver = Solver::load_database(&db_path).expect("Failed to load Tetra3 database");
 
     let zip_file = File::open(zip_path).expect("Failed to open solver_fixtures.zip");
     let mut archive = ZipArchive::new(zip_file).expect("Failed to open zip archive");
@@ -453,6 +455,7 @@ fn test_true_matches_consistency() {
             observer_lst: None,
             min_boresight_altitude: None,
             return_best_failed_match: false,
+            ..Default::default()
         };
 
         let result = solver.solve(
@@ -494,7 +497,7 @@ fn test_out_of_bounds_target_pixel() {
         panic!("Fixture zip not found!");
     }
 
-    let mut solver = Solver::load_database(db_path).expect("Failed to load Tetra3 database");
+    let mut solver = Solver::load_database(&db_path).expect("Failed to load Tetra3 database");
 
     let zip_file = File::open(zip_path).expect("Failed to open solver_fixtures.zip");
     let mut archive = ZipArchive::new(zip_file).expect("Failed to open zip archive");
@@ -539,6 +542,7 @@ fn test_out_of_bounds_target_pixel() {
         observer_lst: None,
         min_boresight_altitude: None,
         return_best_failed_match: false,
+        ..Default::default()
     };
 
     let result = solver.solve(
@@ -620,7 +624,7 @@ fn test_horizon_filter() {
         panic!("Fixture zip not found!");
     }
 
-    let mut solver = Solver::load_database(db_path).expect("Failed to load Tetra3 database");
+    let mut solver = Solver::load_database(&db_path).expect("Failed to load Tetra3 database");
 
     let zip_file = File::open(zip_path).expect("Failed to open solver_fixtures.zip");
     let mut archive = ZipArchive::new(zip_file).expect("Failed to open zip archive");
@@ -659,6 +663,7 @@ fn test_horizon_filter() {
         observer_lst: None,
         min_boresight_altitude: None,
         return_best_failed_match: false,
+        ..Default::default()
     };
 
     // 1. Normal run (should succeed)
@@ -731,7 +736,7 @@ fn test_location_filtering_accuracy() {
         return;
     }
 
-    let mut solver = Solver::load_database(db_path).unwrap();
+    let mut solver = Solver::load_database(&db_path).unwrap();
 
     let zip_file = File::open(zip_path).unwrap();
     let mut archive = ZipArchive::new(zip_file).unwrap();
@@ -803,7 +808,7 @@ fn test_location_filtering_performance() {
         return;
     }
 
-    let mut solver = Solver::load_database(db_path).unwrap();
+    let mut solver = Solver::load_database(&db_path).unwrap();
 
     let zip_file = File::open(zip_path).unwrap();
     let mut archive = ZipArchive::new(zip_file).unwrap();
@@ -901,7 +906,7 @@ fn test_return_best_failed_match_low_confidence() {
         return;
     }
 
-    let mut solver = Solver::load_database(db_path).unwrap();
+    let mut solver = Solver::load_database(&db_path).unwrap();
     let zip_file = File::open(zip_path).unwrap();
     let mut archive = ZipArchive::new(zip_file).unwrap();
 
@@ -997,7 +1002,7 @@ fn test_return_best_failed_match_with_random_noise_no_panic() {
         return;
     }
 
-    let mut solver = Solver::load_database(db_path).unwrap();
+    let mut solver = Solver::load_database(&db_path).unwrap();
 
     // Create random / noise centroids that do not form valid constellations
     let noise_centroids = Array2::from_shape_vec(
@@ -1031,7 +1036,7 @@ fn test_verify_active_pipeline_mode() {
         return;
     }
 
-    let solver = Solver::load_database(db_path).expect("Failed to load test database");
+    let solver = Solver::load_database(&db_path).expect("Failed to load test database");
     assert!(
         !solver.star_vectors.is_empty(),
         "Star table must contain stars"
@@ -1095,4 +1100,87 @@ fn test_verify_active_pipeline_mode() {
         println!("  - Active Feature Flag:   (default)");
         println!("=======================================================\n");
     }
+}
+
+#[test]
+fn test_optical_center_override() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let base_path = Path::new(manifest_dir).join("tests/fixtures");
+    let zip_path = base_path.join("solver_fixtures.zip");
+    let db_path = base_path.join("default_database.npz");
+
+    let zip_file = File::open(zip_path).unwrap();
+    let mut archive = ZipArchive::new(zip_file).unwrap();
+
+    let mut file = archive.by_name("input_1.json").unwrap();
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).unwrap();
+    let input_dto: SolveInputDto = serde_json::from_str(&contents).unwrap();
+
+    let mut solver = Solver::load_database(&db_path).unwrap();
+
+    let mut image_centroids = ndarray::Array2::<f64>::zeros((input_dto.centroids.len(), 2));
+    for (i, c) in input_dto.centroids.iter().enumerate() {
+        image_centroids[[i, 0]] = c[0];
+        image_centroids[[i, 1]] = c[1];
+    }
+
+    let h = input_dto.image_height;
+    let w = input_dto.image_width;
+
+    let mut target_pixel = ndarray::Array2::<f64>::zeros((2, 2));
+    target_pixel[[0, 0]] = h / 2.0; // Center
+    target_pixel[[0, 1]] = w / 2.0;
+    target_pixel[[1, 0]] = h / 2.0 - 100.0; // UP
+    target_pixel[[1, 1]] = w / 2.0;
+
+    let base_options = SolveOptions {
+        fov_estimate: input_dto.options.fov_estimate,
+        target_pixel: Some(target_pixel),
+        ..Default::default()
+    };
+
+    let base_res = solver.solve(&image_centroids, (h, w), base_options);
+    let tetra3::Solution {
+        ra: Some(base_ra),
+        dec: Some(base_dec),
+        roll: Some(base_roll),
+        target_ra: Some(tra),
+        target_dec: Some(tdec),
+        ..
+    } = base_res
+    else {
+        panic!("missing");
+    };
+
+    let ovr_options = SolveOptions {
+        fov_estimate: input_dto.options.fov_estimate,
+        optical_center_override: Some([h / 2.0, w / 2.0]),
+        ..Default::default()
+    };
+    let ovr_res = solver.solve(&image_centroids, (h, w), ovr_options);
+
+    assert!((ovr_res.ra.unwrap() - base_ra).abs() < 1e-6);
+    assert!((ovr_res.dec.unwrap() - base_dec).abs() < 1e-6);
+    assert!((ovr_res.roll.unwrap() - base_roll).abs() < 1e-6);
+
+    let mut tp2 = ndarray::Array2::<f64>::zeros((1, 2));
+    tp2[[0, 0]] = 0.0;
+    tp2[[0, 1]] = 0.0;
+    let base_options_2 = SolveOptions {
+        fov_estimate: input_dto.options.fov_estimate,
+        target_pixel: Some(tp2),
+        ..Default::default()
+    };
+    let base_res_2 = solver.solve(&image_centroids, (h, w), base_options_2);
+
+    let ovr_options_2 = SolveOptions {
+        fov_estimate: input_dto.options.fov_estimate,
+        optical_center_override: Some([0.0, 0.0]),
+        ..Default::default()
+    };
+    let ovr_res_2 = solver.solve(&image_centroids, (h, w), ovr_options_2);
+
+    assert!((ovr_res_2.ra.unwrap() - base_res_2.target_ra.as_ref().unwrap()[0]).abs() < 1e-6);
+    assert!((ovr_res_2.dec.unwrap() - base_res_2.target_dec.as_ref().unwrap()[0]).abs() < 1e-6);
 }

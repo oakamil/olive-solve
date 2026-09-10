@@ -76,6 +76,7 @@ fn map_solve_options(opt: proto::SolveOptions) -> SolveOptions {
         return_best_failed_match: opt
             .return_best_failed_match
             .unwrap_or(def.return_best_failed_match),
+        ..Default::default()
     }
 }
 

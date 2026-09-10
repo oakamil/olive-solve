@@ -1036,6 +1036,36 @@ fn verify_and_build_solution(
         }
         solution.catalog_stars = Some(cat_stars);
     }
+    if let Some([cy, cx]) = options.optical_center_override {
+        let c_flat = [[cy, cx]];
+        let c_vec = compute_vectors_flat_f64(&c_flat, height_f64, width_f64, fov_f64);
+        let mut c_celestial = vec![[0.0; 3]];
+        rotate_vectors_inplace_f64(&precise_rotation_matrix, &c_vec, true, &mut c_celestial, 1);
+
+        let u_flat = [[cy - 100.0, cx]];
+        let u_vec = compute_vectors_flat_f64(&u_flat, height_f64, width_f64, fov_f64);
+        let mut u_celestial = vec![[0.0; 3]];
+        rotate_vectors_inplace_f64(&precise_rotation_matrix, &u_vec, true, &mut u_celestial, 1);
+
+        let c_v = c_celestial[0];
+        let ra0_rad = c_v[1].atan2(c_v[0]);
+        let dec0_rad = c_v[2].clamp(-1.0, 1.0).asin();
+
+        let u_v = u_celestial[0];
+        let ra1_rad = u_v[1].atan2(u_v[0]);
+        let dec1_rad = u_v[2].clamp(-1.0, 1.0).asin();
+
+        let delta_ra = ra0_rad - ra1_rad;
+        let y = delta_ra.sin() * dec1_rad.cos();
+        let x = dec0_rad.cos() * dec1_rad.sin() - dec0_rad.sin() * dec1_rad.cos() * delta_ra.cos();
+
+        let override_roll = y.atan2(x).to_degrees();
+
+        solution.ra = Some(ra0_rad.to_degrees().rem_euclid(360.0));
+        solution.dec = Some(dec0_rad.to_degrees());
+        solution.roll = Some(override_roll.rem_euclid(360.0));
+        solution.rotation_matrix = None;
+    }
 
     if is_match {
         VerificationResult::Success(solution)

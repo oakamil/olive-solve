@@ -142,6 +142,11 @@ pub struct SolveOptions {
     /// This prevents premature termination on weak candidates (which occurs with relaxed thresholds)
     /// while still recovering a solution in obstructed/cluttered star fields.
     pub return_best_failed_match: bool,
+    /// If this image is an off-axis crop, specify the main sensor's optical center
+    /// in this crop's local pixel coordinates [y, x].
+    /// When provided, Solution.ra, dec, and roll will be projected to this optical center
+    /// rather than the physical center of the solved image.
+    pub optical_center_override: Option<[f64; 2]>,
 }
 
 impl Default for SolveOptions {
@@ -164,6 +169,7 @@ impl Default for SolveOptions {
             observer_lst: None,
             min_boresight_altitude: None,
             return_best_failed_match: false,
+            optical_center_override: None,
         }
     }
 }
