@@ -1094,7 +1094,7 @@ impl Imu {
     /// Returns `true` if a full 3D calibration has been established.
     pub fn is_calibrated(&self) -> bool {
         let align = self.alignment.read().unwrap();
-        align.loaded_from_disk || align.calibration_axes.len() >= 3
+        align.loaded_from_disk
     }
 
     /// Retrieves the latest snapshot of the IMU's orientation and motion state.

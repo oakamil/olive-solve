@@ -559,17 +559,30 @@ impl FusedSolver {
 
         if solution.status == SolveStatus::MatchFound {
             let angle_moved = self.get_rotation_since_last_anchor(&time).unwrap_or(0.0);
+
             let max_allowed_error_deg = if angle_moved < STATIONARY_MOTION_THRESHOLD_DEG {
                 STATIONARY_CAMERA_DEVIATION_TOLERANCE_DEG // Stationary since last anchor: reject false solves jumping too far
             } else {
                 MOVING_CAMERA_DEVIATION_TOLERANCE_DEG // Physical slew occurred: tolerate gyro integration drift
             };
 
-            let is_valid =
+            let is_calibrated = self
+                .imu
+                .read()
+                .unwrap()
+                .as_ref()
+                .map_or(false, |i| i.is_calibrated());
+
+            // SVD Bootstrap Guard: If we are uncalibrated and moving, we MUST accept the solve
+            // in order to build the SVD calibration pool. The IMU cannot reject what it cannot project.
+            let is_valid = if angle_moved >= STATIONARY_MOTION_THRESHOLD_DEG && !is_calibrated {
+                true
+            } else {
                 match self.verify_solution_with_imu(&solution, time, max_allowed_error_deg) {
                     Some(valid) => valid,
                     None => true, // Initial bootstrap solve or no IMU: accept
-                };
+                }
+            };
 
             if is_valid {
                 *self.last_solve_failed.write().unwrap() = false;
@@ -843,7 +856,16 @@ impl FusedSolver {
             let lon_opt = *self.longitude.read().unwrap();
 
             if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
-                if let Ok((est, _)) = imu.get_estimated_pointing(&time) {
+                if let Ok((est, is_imu_estimate)) = imu.get_estimated_pointing(&time) {
+                    let angle_moved = imu.get_rotation_since_last_anchor(&time).unwrap_or(0.0);
+
+                    // Stale Anchor Guard: If we've slewed but the IMU returned a static pre-slew anchor,
+                    // it means it lacks SVD calibration to project the delta.
+                    // Rejecting this would create a permanent deadlock.
+                    if angle_moved >= STATIONARY_MOTION_THRESHOLD_DEG && !is_imu_estimate {
+                        return None;
+                    }
+
                     let dt: chrono::DateTime<chrono::Utc> = time.into();
                     let (imu_ra, imu_dec, _) =
                         alt_az_to_ra_dec(est.pitch, est.yaw, est.roll, lat, lon, dt);
