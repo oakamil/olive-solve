@@ -18,8 +18,7 @@ mod hardware {
         delay: Delay,
         report_interval_ms: u16,
         use_calibrated: bool,
-        last_gyro_time: Option<SystemTime>,
-        last_accel_time: Option<SystemTime>,
+        last_poll_time: Option<SystemTime>,
     }
 
     impl Bno085Device {
@@ -77,10 +76,85 @@ mod hardware {
                 delay,
                 report_interval_ms,
                 use_calibrated,
-                last_gyro_time: None,
-                last_accel_time: None,
+                last_poll_time: None,
             })
         }
+    }
+
+    fn pair_bno085_samples(
+        accel_queue: &[(u32, [f32; 3])],
+        gyro_queue: &[(u32, [f32; 3])],
+        report_interval_ms: u16,
+        now: SystemTime,
+        last_poll_time: Option<SystemTime>,
+    ) -> (Vec<SensorEvent>, SystemTime) {
+        let mut events = Vec::new();
+        let max_len = std::cmp::max(accel_queue.len(), gyro_queue.len());
+        if max_len == 0 {
+            return (events, last_poll_time.unwrap_or(now));
+        }
+
+        let fallback_dt = (report_interval_ms as f64) / 1000.0;
+
+        // Determine the expected length primarily from gyro, fallback to accel
+        let expected_len = if !gyro_queue.is_empty() {
+            gyro_queue.len()
+        } else {
+            accel_queue.len()
+        } as f64;
+        let expected_total_time = expected_len * fallback_dt;
+
+        let mut total_dt = if let Some(last) = last_poll_time {
+            now.duration_since(last)
+                .unwrap_or(Duration::from_secs_f64(expected_total_time))
+                .as_secs_f64()
+        } else {
+            expected_total_time
+        };
+
+        // Clamp to [0.5 * expected, 2.5 * expected] to absorb jitter but reject stalls/sleeps
+        if total_dt < 0.5 * expected_total_time {
+            total_dt = 0.5 * expected_total_time;
+        } else if total_dt > 2.5 * expected_total_time {
+            total_dt = 2.5 * expected_total_time;
+        }
+
+        let gyro_dt = if !gyro_queue.is_empty() {
+            total_dt / (gyro_queue.len() as f64)
+        } else {
+            0.0 // dt is exclusively assigned to gyro frames
+        };
+
+        for i in 0..max_len {
+            let accel_vec = accel_queue
+                .get(i)
+                .map(|(_, data)| Vector3::new(data[0] as f64, data[1] as f64, data[2] as f64));
+
+            let gyro_vec = gyro_queue
+                .get(i)
+                .map(|(_, data)| Vector3::new(data[0] as f64, data[1] as f64, data[2] as f64));
+
+            let dt = if gyro_vec.is_some() {
+                Some(gyro_dt)
+            } else {
+                None
+            };
+
+            events.push(SensorEvent {
+                accel: accel_vec,
+                gyro: gyro_vec,
+                dt,
+                ..Default::default()
+            });
+        }
+
+        let next_time = if !gyro_queue.is_empty() {
+            now
+        } else {
+            last_poll_time.unwrap_or(now)
+        };
+
+        (events, next_time)
     }
 
     impl ImuDevice for Bno085Device {
@@ -91,90 +165,22 @@ mod hardware {
         fn poll(&mut self) -> Result<Vec<SensorEvent>, String> {
             let _msg_count = self.imu.handle_all_messages(&mut self.delay, 1);
 
-            let mut events = Vec::new();
-
             let (accel_len, accel_queue) = self.imu.accel_queue();
-            if accel_len > 0 {
-                let now = SystemTime::now();
-                let fallback_dt = (self.report_interval_ms as f64) / 1000.0;
-                for i in 0..accel_len {
-                    let steps_backward = (accel_len - 1 - i) as u32;
-                    let sample_time = now
-                        .checked_sub(Duration::from_secs_f64(
-                            fallback_dt * (steps_backward as f64),
-                        ))
-                        .unwrap_or(now);
-
-                    let (_timestamp, accel_data) = accel_queue[i];
-                    let ax = accel_data[0] as f64;
-                    let ay = accel_data[1] as f64;
-                    let az = accel_data[2] as f64;
-
-                    let dt = if let Some(last) = self.last_accel_time {
-                        sample_time
-                            .duration_since(last)
-                            .unwrap_or(Duration::from_secs_f64(fallback_dt))
-                            .as_secs_f64()
-                    } else {
-                        fallback_dt
-                    };
-
-                    let safe_dt = if dt <= 0.0 { fallback_dt } else { dt };
-                    self.last_accel_time = Some(sample_time);
-                    events.push(SensorEvent {
-                        accel: Some(Vector3::new(ax, ay, az)),
-                        dt: Some(safe_dt),
-                        ..Default::default()
-                    });
-                }
-            }
-
-            // Since we are polling over I2C without a hardware interrupt (HINT) pin, the BNO085's
-            // internal timestamps reset on packet boundaries, making them unusable for absolute time.
-            // Instead, we use "back-dating": we anchor the *last* sample in the queue to the host's
-            // current wall-clock time (`now`), and step backwards by the requested hardware interval
-            // for each preceding sample. This forces the boundary sample to absorb any I2C loop jitter
-            // keeping the integration timeline aligned with real-world physical time.
             let (gyro_len, gyro_queue) = if self.use_calibrated {
                 self.imu.calibrated_gyro_queue()
             } else {
                 self.imu.gyro_queue()
             };
 
-            if gyro_len > 0 {
-                let now = SystemTime::now();
-                let fallback_dt = (self.report_interval_ms as f64) / 1000.0;
-                for i in 0..gyro_len {
-                    let steps_backward = (gyro_len - 1 - i) as u32;
-                    let sample_time = now
-                        .checked_sub(Duration::from_secs_f64(
-                            fallback_dt * (steps_backward as f64),
-                        ))
-                        .unwrap_or(now);
-
-                    let (_timestamp, gyro_data) = gyro_queue[i];
-                    let wx = gyro_data[0] as f64;
-                    let wy = gyro_data[1] as f64;
-                    let wz = gyro_data[2] as f64;
-
-                    let dt = if let Some(last) = self.last_gyro_time {
-                        sample_time
-                            .duration_since(last)
-                            .unwrap_or(Duration::from_secs_f64(fallback_dt))
-                            .as_secs_f64()
-                    } else {
-                        fallback_dt
-                    };
-
-                    let safe_dt = if dt <= 0.0 { fallback_dt } else { dt };
-                    self.last_gyro_time = Some(sample_time);
-                    events.push(SensorEvent {
-                        gyro: Some(Vector3::new(wx, wy, wz)),
-                        dt: Some(safe_dt),
-                        ..Default::default()
-                    });
-                }
-            }
+            let now = SystemTime::now();
+            let (mut events, new_time) = pair_bno085_samples(
+                &accel_queue[0..accel_len],
+                &gyro_queue[0..gyro_len],
+                self.report_interval_ms,
+                now,
+                self.last_poll_time,
+            );
+            self.last_poll_time = Some(new_time);
 
             if let Ok(q) = self.imu.rotation_quaternion() {
                 // Only process the quaternion if it has been populated by the sensor (not all zeros)
@@ -219,6 +225,52 @@ mod hardware {
                 .enable_rotation_vector(self.report_interval_ms)
                 .map_err(|e| format!("Failed to revive rotation vector: {:?}", e))?;
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::time::{Duration, SystemTime};
+
+        #[test]
+        fn test_pair_bno085_samples_empty_poll() {
+            let now = SystemTime::now();
+            let last = now.checked_sub(Duration::from_millis(20)).unwrap();
+
+            let (events, next_time) = pair_bno085_samples(&[], &[], 10, now, Some(last));
+
+            assert_eq!(events.len(), 0);
+            assert_eq!(next_time, last); // Should NOT advance to now
+        }
+
+        #[test]
+        fn test_pair_bno085_samples_accel_only() {
+            let now = SystemTime::now();
+            let last = now.checked_sub(Duration::from_millis(20)).unwrap();
+
+            let accel = vec![(0, [1.0, 2.0, 3.0])];
+            let (events, next_time) = pair_bno085_samples(&accel, &[], 10, now, Some(last));
+
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].dt, None); // dt should be none for accel-only
+            assert_eq!(next_time, last); // Should NOT advance to now
+        }
+
+        #[test]
+        fn test_pair_bno085_samples_symmetric() {
+            let now = SystemTime::now();
+            let last = now.checked_sub(Duration::from_millis(20)).unwrap();
+
+            let accel = vec![(0, [1.0, 2.0, 3.0]), (1, [4.0, 5.0, 6.0])];
+            let gyro = vec![(0, [0.1, 0.2, 0.3]), (1, [0.4, 0.5, 0.6])];
+
+            let (events, next_time) = pair_bno085_samples(&accel, &gyro, 10, now, Some(last));
+
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].dt, Some(0.01));
+            assert_eq!(events[1].dt, Some(0.01));
+            assert_eq!(next_time, now);
         }
     }
 }

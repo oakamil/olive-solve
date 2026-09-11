@@ -114,7 +114,10 @@ mod hardware {
                         let header = buffer[i];
                         i += 1;
 
-                        if header == 0x84 {
+                        // Mask out interrupt tag bits (bits 1:0) for regular frames
+                        let base_header = header & 0xFC;
+
+                        if base_header == 0x88 {
                             // Gyro only frame (Header + 6 bytes)
                             if i + 6 <= len + 1 {
                                 // Data in FIFO is little-endian: LSB, MSB
@@ -133,7 +136,7 @@ mod hardware {
                             } else {
                                 break; // Malformed / cut off
                             }
-                        } else if header == 0x88 {
+                        } else if base_header == 0x84 {
                             // Accel only frame (Header + 6 bytes)
                             if i + 6 <= len + 1 {
                                 let ax = (buffer[i] as u16 | ((buffer[i + 1] as u16) << 8)) as i16;
@@ -152,7 +155,7 @@ mod hardware {
                             } else {
                                 break;
                             }
-                        } else if header == 0x8C {
+                        } else if base_header == 0x8C {
                             // Gyro + Accel frame (Header + 12 bytes). Gyro first, then Accel.
                             if i + 12 <= len + 1 {
                                 let gx = (buffer[i] as u16 | ((buffer[i + 1] as u16) << 8)) as i16;
@@ -202,7 +205,7 @@ mod hardware {
                             // Empty / Invalid (end of valid data)
                             break;
                         } else {
-                            // Unknown header (maybe Accel/Mag was enabled by mistake or misalignment)
+                            // Unknown header (maybe Mag was enabled by mistake or misalignment)
                             // Safety break to prevent infinite loops or garbage data
                             log::warn!("BMI160 unknown header: 0x{:X} at index {}", header, i - 1);
                             break;
@@ -213,6 +216,7 @@ mod hardware {
                     // Because the BMI160 generates this internally and independently, it is immune to I2C jitter.
                     // We simply calculate the exact hardware ticks elapsed since the last batch, handle 24-bit
                     // wraparounds, and evenly distribute that total physical time across the samples in the batch.
+                    let num_gyro = frames.iter().filter(|(g, _)| g.is_some()).count();
                     let total_dt = if let Some(time) = current_sensor_time {
                         let dt = if let Some(last_time) = self.last_sensor_time {
                             // SENSORTIME is a 24-bit counter with 39us resolution
@@ -226,36 +230,41 @@ mod hardware {
                             }
                             (diff as f64) * 39.0e-6
                         } else {
-                            // Initial fallback: assume 10ms per frame (for 100Hz default ODR)
-                            0.01 * (frames.len() as f64).max(1.0)
+                            // Initial fallback: assume 10ms per gyro frame (for 100Hz default ODR)
+                            0.01 * (num_gyro as f64).max(1.0)
                         };
                         self.last_sensor_time = Some(time);
                         dt
                     } else {
                         // Fallback if sensortime was missing
-                        0.01 * (frames.len() as f64).max(1.0)
+                        0.01 * (num_gyro as f64).max(1.0)
                     };
 
                     if !frames.is_empty() {
-                        let avg_dt = total_dt / (frames.len() as f64);
+                        let gyro_dt = if num_gyro > 0 {
+                            total_dt / (num_gyro as f64)
+                        } else {
+                            0.0
+                        };
+
                         for (opt_g, opt_a) in frames {
                             if let (Some(g), Some(a)) = (opt_g, opt_a) {
                                 readings.push(SensorEvent {
                                     gyro: Some(g),
                                     accel: Some(a),
-                                    dt: Some(avg_dt),
+                                    dt: Some(gyro_dt),
                                     ..Default::default()
                                 });
                             } else if let Some(g) = opt_g {
                                 readings.push(SensorEvent {
                                     gyro: Some(g),
-                                    dt: Some(avg_dt),
+                                    dt: Some(gyro_dt),
                                     ..Default::default()
                                 });
                             } else if let Some(a) = opt_a {
                                 readings.push(SensorEvent {
                                     accel: Some(a),
-                                    dt: Some(avg_dt),
+                                    dt: None,
                                     ..Default::default()
                                 });
                             }
