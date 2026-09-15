@@ -2,12 +2,11 @@
 // See LICENSE file in root directory for license terms.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use log::{debug, error, info, warn};
 use nalgebra::{Matrix3, Rotation3, UnitQuaternion, Vector3};
-use std::sync::RwLock;
 
 use crate::storage::PersistentStorage;
 
@@ -27,11 +26,9 @@ const SETTLE_TIME_MS: u64 = 100;
 /// The maximum angular movement (in degrees) for the telescope to be considered stationary.
 pub const STATIONARY_MOTION_THRESHOLD_DEG: f64 = 1.0;
 
-/// The maximum allowed plate-solve deviation (in degrees) when the telescope is stationary.
-pub const STATIONARY_CAMERA_DEVIATION_TOLERANCE_DEG: f64 = 5.0;
-
-/// The maximum allowed discrepancy (in degrees) between the plate-solve motion and the IMU motion when slewing.
-pub const MOVING_CAMERA_DEVIATION_TOLERANCE_DEG: f64 = 20.0;
+/// The maximum discrepancy (in degrees) between the IMU's physical slew magnitude and the
+/// camera's slew magnitude to allow an axis pair into the SVD calibration pool.
+pub const SVD_CALIBRATION_DEVIATION_TOLERANCE_DEG: f64 = 5.0;
 
 /// Represents the current physical motion state of the IMU.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -111,16 +108,16 @@ pub struct AlignmentState {
     pub mount_q: UnitQuaternion<f64>,
     /// The calculated calibration health between the camera and IMU.
     pub transform_metrics: Option<TransformMetrics>,
-    /// Store distinct rotational axes to continuously refine the 3D calibration
+    /// Store distinct rotational axes to bootstrap the 3D calibration until locked
     pub calibration_axes: Vec<(Vector3<f64>, Vector3<f64>)>,
     /// Flag to track if the current mount_q was loaded from disk or previously locked
-    pub loaded_from_disk: bool,
-    /// Flag to allow one-time hardware alteration check at session startup
-    pub startup_hardware_check_pending: bool,
+    pub is_locked: bool,
+    /// Counter for how many good slews have passed the startup sanity check
+    pub startup_slews_passed: u8,
     /// The highest confidence score achieved by the currently locked mount_q
     pub best_calibration_confidence: f64,
-    /// Counter to throttle SD card writes
-    pub calibration_updates_since_save: usize,
+    /// Counter for tracking massive projection errors during startup
+    pub startup_strikes: u8,
     /// Rolling history of expected vs true error for metric tracking
     pub error_history: Vec<f64>,
 }
@@ -133,10 +130,10 @@ impl Default for AlignmentState {
             mount_q: UnitQuaternion::identity(),
             transform_metrics: None,
             calibration_axes: Vec::new(),
-            loaded_from_disk: false,
-            startup_hardware_check_pending: false,
+            is_locked: false,
+            startup_slews_passed: 0,
             best_calibration_confidence: 0.0,
-            calibration_updates_since_save: 0,
+            startup_strikes: 0,
             error_history: Vec::new(),
         }
     }
@@ -229,8 +226,9 @@ impl Imu {
                 ) {
                     initial_alignment.mount_q =
                         UnitQuaternion::new_normalize(nalgebra::Quaternion::new(w, x, y, z));
-                    initial_alignment.loaded_from_disk = true; // Protect this saved matrix
-                    initial_alignment.startup_hardware_check_pending = true;
+                    initial_alignment.is_locked = true; // Protect this saved matrix
+                    initial_alignment.startup_slews_passed = 0;
+                    initial_alignment.startup_strikes = 0;
                     initial_alignment.best_calibration_confidence = confidence;
                     info!(
                         "Successfully loaded saved calibration (Confidence: {:.1}%): {:.3}, {:.3}, {:.3}, {:.3}",
@@ -248,8 +246,8 @@ impl Imu {
 
         let alignment = Arc::new(RwLock::new(initial_alignment));
 
-        // 3 seconds of IMU history (capped at 300 items for 100Hz)
-        let history = Arc::new(Mutex::new(VecDeque::with_capacity(300)));
+        // 10 seconds of IMU history (capped at 1000 items for 100Hz)
+        let history = Arc::new(Mutex::new(VecDeque::with_capacity(1000)));
         let history_clone = Arc::clone(&history);
 
         let calibration = Arc::new(Mutex::new(CalibrationState::default()));
@@ -450,7 +448,7 @@ impl Imu {
                                         current_motion_state,
                                         gyro_vec_deg,
                                     ));
-                                    if hist.len() > 500 {
+                                    if hist.len() > 1000 {
                                         hist.pop_front();
                                     }
                                 }
@@ -599,7 +597,7 @@ impl Imu {
             }
         }
 
-        if min_diff > Duration::from_secs(5) {
+        if min_diff > Duration::from_secs(10) {
             warn!(
                 "Nearest IMU frame is {}ms off. Rejecting out-of-sync timestamp.",
                 min_diff.as_millis()
@@ -644,315 +642,261 @@ impl Imu {
     /// Updates the IMU anchor based on a true camera position from a successful plate solve.
     /// Returns early if no valid quaternion was found in history near `timestamp`.
     pub fn update_anchor(&self, camera_pointing: &MountCoordinates, timestamp: &SystemTime) {
-        let imu_state = *self.state.read().unwrap();
+        if self.state.read().unwrap().is_none() {
+            return;
+        }
 
-        if imu_state.is_some() {
-            // Find the exact historical quaternion that matches the image timestamp
-            let historical_imu_q = self.get_historical_quat(timestamp);
+        let Some((hist_q, motion_state)) = self.get_historical_quat(timestamp) else {
+            return;
+        };
 
-            if let Some((hist_q, motion_state)) = historical_imu_q {
-                if motion_state != MotionState::Stable {
-                    debug!(
-                        "Image was captured during movement. Rejecting anchor to prevent timestamp and rolling shutter artifacts."
-                    );
-                    return;
-                }
+        if motion_state != MotionState::Stable {
+            debug!(
+                "Image was captured during movement. Rejecting anchor to prevent timestamp and rolling shutter artifacts."
+            );
+            return;
+        }
 
-                let mut align = self.alignment.write().unwrap();
-                let new_true_q = Self::mount_to_quat(camera_pointing);
+        let mut align = self.alignment.write().unwrap();
+        let new_true_q = Self::mount_to_quat(camera_pointing);
 
-                if let (Some(old_mount), Some(old_quat)) =
-                    (align.last_camera_position, align.imu_anchor_state)
-                {
-                    let old_true_q = Self::mount_to_quat(&old_mount);
+        let error_fraction = if let (Some(old_mount), Some(old_quat)) =
+            (align.last_camera_position, align.imu_anchor_state)
+        {
+            let old_true_q = Self::mount_to_quat(&old_mount);
 
-                    // Continuous SVD calibration (Wahba's Problem)
-                    let q_true_delta = old_true_q.conjugate() * new_true_q;
-                    let q_imu_delta = old_quat.conjugate() * hist_q;
+            // Calculate the projection error using the CURRENT matrix
+            let imu_local_delta = old_quat.conjugate() * hist_q;
+            let cam_local_delta = align.mount_q * imu_local_delta * align.mount_q.conjugate();
+            let final_expected = old_true_q * cam_local_delta;
+            let final_error_quat = final_expected.inverse() * new_true_q;
+            let final_error_angle = final_error_quat.angle().to_degrees();
 
-                    let angle_cam = q_true_delta.angle().to_degrees();
-                    let angle_imu = q_imu_delta.angle().to_degrees();
+            let q_true_delta = old_true_q.conjugate() * new_true_q;
+            let q_imu_delta = old_quat.conjugate() * hist_q;
 
-                    // SVD Calibration Eligibility:
-                    // Both sensors must detect significant physical motion and agree on the slew magnitude.
-                    let svd_eligible = angle_cam >= STATIONARY_MOTION_THRESHOLD_DEG
-                        && angle_imu >= STATIONARY_MOTION_THRESHOLD_DEG
-                        && (angle_cam - angle_imu).abs() <= MOVING_CAMERA_DEVIATION_TOLERANCE_DEG;
+            let angle_cam = q_true_delta.angle().to_degrees();
+            let angle_imu = q_imu_delta.angle().to_degrees();
 
-                    if svd_eligible {
-                        if let (Some(axis_true), Some(axis_imu)) =
-                            (q_true_delta.axis(), q_imu_delta.axis())
-                        {
-                            let t_vec = axis_true.into_inner();
-                            let i_vec = axis_imu.into_inner();
+            if align.is_locked {
+                // 1. Startup Sanity Check (Only active for the first few slews)
+                if align.startup_slews_passed < 3 && angle_cam > STATIONARY_MOTION_THRESHOLD_DEG {
+                    if final_error_angle > HARDWARE_ALTERATION_THRESHOLD_DEG {
+                        align.startup_strikes += 1;
+                        warn!(
+                            "Startup sanity check: Strike {}/3 (Error: {:.1}°)",
+                            align.startup_strikes, final_error_angle
+                        );
 
-                            let mut replaced = false;
-                            for (existing_t, existing_i) in align.calibration_axes.iter_mut() {
-                                // If the new physical axis is highly parallel to an existing one (cos(11 deg) ≈ 0.98)
-                                if existing_t.dot(&t_vec).abs() > 0.98 {
-                                    // Overwrite it! This keeps the calibration mathematically fresh
-                                    // without destroying our hard-earned 3D spatial diversity!
-                                    *existing_t = t_vec;
-                                    *existing_i = i_vec;
-                                    replaced = true;
-                                    break;
-                                }
-                            }
+                        if align.startup_strikes >= 3 {
+                            warn!("Hardware alteration detected! Discarding disk SVD calibration.");
+                            align.is_locked = false;
+                            align.calibration_axes.clear();
+                            align.best_calibration_confidence = 0.0;
 
-                            if !replaced {
-                                align.calibration_axes.push((t_vec, i_vec));
-                                if align.calibration_axes.len() > 100 {
-                                    align.calibration_axes.remove(0);
-                                }
-                            }
-
-                            let mut is_rank_sufficient = false;
-                            for i in 0..align.calibration_axes.len() {
-                                for j in (i + 1)..align.calibration_axes.len() {
-                                    if align.calibration_axes[i]
-                                        .0
-                                        .dot(&align.calibration_axes[j].0)
-                                        .abs()
-                                        < 0.95
-                                    {
-                                        is_rank_sufficient = true;
-                                        break;
-                                    }
-                                }
-                                if is_rank_sufficient {
-                                    break;
-                                }
-                            }
-
-                            if is_rank_sufficient {
-                                let mut b = Matrix3::zeros();
-
-                                // SVD Matrix Construction
-                                for (t, i) in &align.calibration_axes {
-                                    b += t * i.transpose();
-                                }
-
-                                let svd = b.svd(true, true);
-                                if let (Some(u), Some(v_t)) = (svd.u, svd.v_t) {
-                                    // --- CALIBRATION CONFIDENCE SCORING ---
-                                    // Extract singular values (sigma_1 is max, sigma_3 is min).
-                                    // The ratio of min to max defines the true 3D geometric volume of the calibration.
-                                    let sigma_1 = svd.singular_values[0];
-                                    let sigma_3 = svd.singular_values[2];
-
-                                    let new_pool_confidence = if sigma_1 > 0.0 {
-                                        sigma_3 / sigma_1
-                                    } else {
-                                        0.0
-                                    };
-
-                                    let det = (u * v_t).determinant();
-                                    let mut d = Matrix3::identity();
-                                    if det < 0.0 {
-                                        d[(2, 2)] = -1.0;
-                                    }
-
-                                    let r_mount = u * d * v_t;
-
-                                    if r_mount.iter().all(|val| val.is_finite()) {
-                                        let calculated_q = UnitQuaternion::from_rotation_matrix(
-                                            &Rotation3::from_matrix_unchecked(r_mount),
-                                        );
-
-                                        let is_mature =
-                                            align.calibration_axes.len() >= SVD_MATURITY_SIZE;
-                                        let hardware_shift_deg = (align.mount_q.inverse()
-                                            * calculated_q)
-                                            .angle()
-                                            .to_degrees();
-
-                                        if !align.loaded_from_disk {
-                                            // Bootstrapping phase. Update fluidly to get the UI tracking immediately.
-                                            align.mount_q = calculated_q;
-                                            align.best_calibration_confidence = new_pool_confidence;
-
-                                            // Save to disk immediately so progress isn't lost if the app closes
-                                            self.save_calibration_to_disk(
-                                                align.mount_q,
-                                                align.best_calibration_confidence,
-                                            );
-
-                                            // Only lock to High Water Mark mode once we have enough diverse data points
-                                            if is_mature {
-                                                align.loaded_from_disk = true; // Upgrade status to protected
-                                                info!(
-                                                    "Bootstrapping complete. Calibration Locked! Confidence: {:.1}%",
-                                                    align.best_calibration_confidence * 100.0
-                                                );
-                                            }
-                                        } else if align.startup_hardware_check_pending {
-                                            // Startup verification: detect if hardware was physically remounted between sessions
-                                            if is_mature
-                                                && new_pool_confidence >= MIN_CALIBRATION_CONFIDENCE
-                                                && hardware_shift_deg
-                                                    > HARDWARE_ALTERATION_THRESHOLD_DEG
-                                            {
-                                                warn!(
-                                                    "Hardware alteration detected at startup! New matrix differs by {:.2}°. Updating calibration.",
-                                                    hardware_shift_deg
-                                                );
-                                                align.mount_q = calculated_q;
-                                                align.best_calibration_confidence =
-                                                    new_pool_confidence;
-                                                self.save_calibration_to_disk(
-                                                    align.mount_q,
-                                                    align.best_calibration_confidence,
-                                                );
-                                            }
-                                            if is_mature {
-                                                align.startup_hardware_check_pending = false;
-                                            }
-                                        } else if new_pool_confidence
-                                            > align.best_calibration_confidence
-                                            && hardware_shift_deg <= 10.0
-                                        {
-                                            // Incremental upgrade during runtime tracking
-                                            info!(
-                                                "Upgrading calibration matrix! Confidence increased from {:.1}% to {:.1}% (Shift: {:.2}°)",
-                                                align.best_calibration_confidence * 100.0,
-                                                new_pool_confidence * 100.0,
-                                                hardware_shift_deg
-                                            );
-                                            align.mount_q = calculated_q;
-                                            align.best_calibration_confidence = new_pool_confidence;
-
-                                            align.calibration_updates_since_save += 1;
-                                            if align.calibration_updates_since_save % 5 == 0 {
-                                                self.save_calibration_to_disk(
-                                                    align.mount_q,
-                                                    align.best_calibration_confidence,
-                                                );
-                                            }
-                                        } else {
-                                            // Coasting Phase. The active hardware is identical, and the new pool is flatter than our historical best.
-                                            // Ignore the SVD calculation to protect the High Water Mark matrix.
-                                        }
-                                    } else {
-                                        warn!("SVD generated NaNs. Keeping previous safe mount_q.");
-                                    }
-                                }
-                            } else {
-                                debug!(
-                                    "Calibration pool lacks distinct axes. Need movement on a different plane to run SVD."
-                                );
+                            if let Some(storage) = self.storage.clone() {
+                                std::thread::spawn(move || storage.remove(CALIBRATION_KEY));
                             }
                         }
                     } else {
-                        debug!(
-                            "Movement (cam: {:.2}°, imu: {:.2}°) not eligible for SVD calibration.",
-                            angle_cam, angle_imu
-                        );
-                    }
-
-                    // Recalculate error metric post-SVD refinement for reporting
-                    let imu_local_delta = old_quat.conjugate() * hist_q;
-                    let cam_local_delta =
-                        align.mount_q * imu_local_delta * align.mount_q.conjugate();
-                    let final_expected = old_true_q * cam_local_delta;
-
-                    let final_error_quat = final_expected.inverse() * new_true_q;
-                    let final_error_angle = final_error_quat.angle().to_degrees();
-
-                    if angle_cam > 5.0 {
-                        align.error_history.push(final_error_angle);
-                        if align.error_history.len() > 20 {
-                            align.error_history.remove(0);
-                        }
-                        let avg_error: f64 = align.error_history.iter().sum::<f64>()
-                            / (align.error_history.len() as f64);
-
-                        // --- ALT/AZ ERROR COMPONENT LOGGING ---
-                        let expected_coords = Self::quat_to_mount(&final_expected);
-                        let true_coords = Self::quat_to_mount(&new_true_q);
-
-                        let alt_error = true_coords.pitch - expected_coords.pitch;
-
-                        let mut az_error = true_coords.yaw - expected_coords.yaw;
-                        if az_error > 180.0 {
-                            az_error -= 360.0;
-                        }
-                        if az_error < -180.0 {
-                            az_error += 360.0;
-                        }
-
-                        let mut roll_error = true_coords.roll - expected_coords.roll;
-                        if roll_error > 180.0 {
-                            roll_error -= 360.0;
-                        }
-                        if roll_error < -180.0 {
-                            roll_error += 360.0;
-                        }
-
+                        align.startup_strikes = 0; // Reset strikes on good slew
+                        align.startup_slews_passed += 1;
                         info!(
-                            "Expected vs True error: {:.3}° (Rolling Avg: {:.3}°) | Alt Err: {:.3}°, Az Err: {:.3}°, Roll Err: {:.3}° | Confidence: {:.1}%",
-                            final_error_angle,
-                            avg_error,
-                            alt_error,
-                            az_error,
-                            roll_error,
-                            align.best_calibration_confidence * 100.0
+                            "Startup sanity check: Passed {}/3",
+                            align.startup_slews_passed
                         );
+                        if align.startup_slews_passed >= 3 {
+                            info!(
+                                "Startup calibration verified. SVD Matrix strictly locked for session."
+                            );
+                        }
                     }
-
-                    // Assume standard optical camera axes: View = +Z, Up = +Y.
-                    // Rotate the camera axes into the IMU's reference frame using our calibration matrix.
-                    let cam_view_in_imu = align.mount_q.conjugate() * Vector3::new(0.0, 0.0, 1.0);
-                    let cam_up_in_imu = align.mount_q.conjugate() * Vector3::new(0.0, 1.0, 0.0);
-
-                    let (view_axis, view_misalign) = Self::get_closest_imu_axis(&cam_view_in_imu);
-                    let (up_axis, up_misalign) = Self::get_closest_imu_axis(&cam_up_in_imu);
-
-                    align.transform_metrics = Some(TransformMetrics {
-                        transform_error_fraction: final_error_angle / angle_cam.max(0.001),
-                        camera_view_gyro_axis: view_axis,
-                        camera_view_misalignment: view_misalign,
-                        camera_up_gyro_axis: up_axis,
-                        camera_up_misalignment: up_misalign,
-                    });
-
-                    // Pointing Anchor Update
-                    let is_valid_anchor_update = if angle_imu < STATIONARY_MOTION_THRESHOLD_DEG {
-                        angle_cam <= STATIONARY_CAMERA_DEVIATION_TOLERANCE_DEG
-                    } else {
-                        (angle_cam - angle_imu).abs() <= MOVING_CAMERA_DEVIATION_TOLERANCE_DEG
-                    };
-
-                    if is_valid_anchor_update {
-                        align.last_camera_position = Some(*camera_pointing);
-                        align.imu_anchor_state = Some(hist_q);
-                    } else {
-                        debug!(
-                            "Rejecting anchor update: discrepancy too large (cam: {:.2}°, imu: {:.2}°)",
-                            angle_cam, angle_imu
-                        );
-                    }
-                } else {
-                    info!("Initial plate-solve anchor locked in.");
-
-                    let cam_view_in_imu = align.mount_q.conjugate() * Vector3::new(0.0, 0.0, 1.0);
-                    let cam_up_in_imu = align.mount_q.conjugate() * Vector3::new(0.0, 1.0, 0.0);
-
-                    let (view_axis, view_misalign) = Self::get_closest_imu_axis(&cam_view_in_imu);
-                    let (up_axis, up_misalign) = Self::get_closest_imu_axis(&cam_up_in_imu);
-
-                    align.transform_metrics = Some(TransformMetrics {
-                        transform_error_fraction: 0.0,
-                        camera_view_gyro_axis: view_axis,
-                        camera_view_misalignment: view_misalign,
-                        camera_up_gyro_axis: up_axis,
-                        camera_up_misalignment: up_misalign,
-                    });
-
-                    align.last_camera_position = Some(*camera_pointing);
-                    align.imu_anchor_state = Some(hist_q);
                 }
             }
-        }
+
+            if !align.is_locked {
+                // 3. Bootstrapping Phase (Runs if NOT locked, or if sanity check failed)
+                // SVD Calibration Eligibility:
+                // Both sensors must detect significant physical motion and agree on the slew magnitude.
+                let svd_eligible = angle_cam >= STATIONARY_MOTION_THRESHOLD_DEG
+                    && angle_imu >= STATIONARY_MOTION_THRESHOLD_DEG
+                    && (angle_cam - angle_imu).abs() <= SVD_CALIBRATION_DEVIATION_TOLERANCE_DEG;
+
+                if svd_eligible {
+                    if let (Some(axis_true), Some(axis_imu)) =
+                        (q_true_delta.axis(), q_imu_delta.axis())
+                    {
+                        let t_vec = axis_true.into_inner();
+                        let i_vec = axis_imu.into_inner();
+
+                        let mut replaced = false;
+                        for (existing_t, existing_i) in align.calibration_axes.iter_mut() {
+                            if existing_t.dot(&t_vec).abs() > 0.98 {
+                                *existing_t = t_vec;
+                                *existing_i = i_vec;
+                                replaced = true;
+                                break;
+                            }
+                        }
+
+                        if !replaced {
+                            align.calibration_axes.push((t_vec, i_vec));
+                            if align.calibration_axes.len() > 100 {
+                                align.calibration_axes.remove(0);
+                            }
+                        }
+
+                        let mut is_rank_sufficient = false;
+                        for i in 0..align.calibration_axes.len() {
+                            for j in (i + 1)..align.calibration_axes.len() {
+                                if align.calibration_axes[i]
+                                    .0
+                                    .dot(&align.calibration_axes[j].0)
+                                    .abs()
+                                    < 0.95
+                                {
+                                    is_rank_sufficient = true;
+                                    break;
+                                }
+                            }
+                            if is_rank_sufficient {
+                                break;
+                            }
+                        }
+
+                        if is_rank_sufficient {
+                            let mut b = Matrix3::zeros();
+                            for (t, i) in align.calibration_axes.iter() {
+                                b += t * i.transpose();
+                            }
+
+                            let svd = b.svd(true, true);
+                            if let (Some(u), Some(v_t)) = (svd.u, svd.v_t) {
+                                let sigma_1 = svd.singular_values[0];
+                                let sigma_3 = svd.singular_values[2];
+                                let new_pool_confidence = if sigma_1 > 0.0 {
+                                    sigma_3 / sigma_1
+                                } else {
+                                    0.0
+                                };
+
+                                let det = (u * v_t).determinant();
+                                let mut d = Matrix3::identity();
+                                if det < 0.0 {
+                                    d[(2, 2)] = -1.0;
+                                }
+                                let r_mount = u * d * v_t;
+
+                                if r_mount.iter().all(|val| val.is_finite()) {
+                                    let calculated_q = UnitQuaternion::from_rotation_matrix(
+                                        &Rotation3::from_matrix_unchecked(r_mount),
+                                    );
+
+                                    align.mount_q = calculated_q;
+                                    align.best_calibration_confidence = new_pool_confidence;
+
+                                    let is_mature =
+                                        align.calibration_axes.len() >= SVD_MATURITY_SIZE;
+                                    if is_mature
+                                        && new_pool_confidence >= MIN_CALIBRATION_CONFIDENCE
+                                    {
+                                        align.is_locked = true;
+                                        align.startup_slews_passed = 3;
+                                        align.error_history.clear();
+                                        self.save_calibration_to_disk(
+                                            align.mount_q,
+                                            align.best_calibration_confidence,
+                                        );
+                                        info!(
+                                            "Bootstrapping complete. SVD Matrix strictly locked for session! Confidence: {:.1}%",
+                                            new_pool_confidence * 100.0
+                                        );
+                                    }
+                                } else {
+                                    warn!("SVD generated NaNs. Keeping previous safe mount_q.");
+                                }
+                            }
+                        } else {
+                            debug!(
+                                "Calibration pool lacks distinct axes. Need movement on a different plane to run SVD."
+                            );
+                        }
+                    }
+                } else {
+                    debug!(
+                        "Movement (cam: {:.2}°, imu: {:.2}°) not eligible for SVD calibration.",
+                        angle_cam, angle_imu
+                    );
+                }
+            }
+
+            if angle_cam > 5.0 {
+                align.error_history.push(final_error_angle);
+                if align.error_history.len() > 20 {
+                    align.error_history.remove(0);
+                }
+                let avg_error: f64 =
+                    align.error_history.iter().sum::<f64>() / (align.error_history.len() as f64);
+
+                // --- ALT/AZ ERROR COMPONENT LOGGING ---
+                let expected_coords = Self::quat_to_mount(&final_expected);
+                let true_coords = Self::quat_to_mount(&new_true_q);
+
+                let alt_error = true_coords.pitch - expected_coords.pitch;
+
+                let mut az_error = true_coords.yaw - expected_coords.yaw;
+                if az_error > 180.0 {
+                    az_error -= 360.0;
+                }
+                if az_error < -180.0 {
+                    az_error += 360.0;
+                }
+
+                let mut roll_error = true_coords.roll - expected_coords.roll;
+                if roll_error > 180.0 {
+                    roll_error -= 360.0;
+                }
+                if roll_error < -180.0 {
+                    roll_error += 360.0;
+                }
+
+                info!(
+                    "Expected vs True error: {:.3}° (Rolling Avg: {:.3}°) | Alt Err: {:.3}°, Az Err: {:.3}°, Roll Err: {:.3}° | Confidence: {:.1}%",
+                    final_error_angle,
+                    avg_error,
+                    alt_error,
+                    az_error,
+                    roll_error,
+                    align.best_calibration_confidence * 100.0
+                );
+            }
+
+            final_error_angle / angle_cam.max(0.001)
+        } else {
+            info!("Initial plate-solve anchor locked in.");
+            0.0
+        };
+
+        // Assume standard optical camera axes: View = +Z, Up = +Y.
+        // Rotate the camera axes into the IMU's reference frame using our calibration matrix.
+        let cam_view_in_imu = align.mount_q.conjugate() * Vector3::new(0.0, 0.0, 1.0);
+        let cam_up_in_imu = align.mount_q.conjugate() * Vector3::new(0.0, 1.0, 0.0);
+
+        let (view_axis, view_misalign) = Self::get_closest_imu_axis(&cam_view_in_imu);
+        let (up_axis, up_misalign) = Self::get_closest_imu_axis(&cam_up_in_imu);
+
+        align.transform_metrics = Some(TransformMetrics {
+            transform_error_fraction: error_fraction,
+            camera_view_gyro_axis: view_axis,
+            camera_view_misalignment: view_misalign,
+            camera_up_gyro_axis: up_axis,
+            camera_up_misalignment: up_misalign,
+        });
+
+        // Pointing Anchor Update
+        // We unconditionally apply the provided anchor position as the new ground truth.
+        align.last_camera_position = Some(*camera_pointing);
+        align.imu_anchor_state = Some(hist_q);
     }
 
     /// Updates the positional IMU anchor from a true camera position without adding
@@ -963,34 +907,32 @@ impl Imu {
         camera_pointing: &MountCoordinates,
         timestamp: &SystemTime,
     ) {
-        let imu_state = *self.state.read().unwrap();
-
-        if imu_state.is_some() {
-            let historical_imu_q = self.get_historical_quat(timestamp);
-
-            if let Some((hist_q, motion_state)) = historical_imu_q {
-                if motion_state != MotionState::Stable {
-                    debug!(
-                        "Image was captured during movement. Rejecting pointing anchor update to prevent timestamp and rolling shutter artifacts."
-                    );
-                    return;
-                }
-
-                let mut align = self.alignment.write().unwrap();
-                align.last_camera_position = Some(*camera_pointing);
-                align.imu_anchor_state = Some(hist_q);
-
-                debug!(
-                    "IMU pointing anchor successfully updated from low-confidence solve. SVD calibration bypassed."
-                );
-            }
+        if self.state.read().unwrap().is_none() {
+            return;
         }
+
+        let Some((hist_q, motion_state)) = self.get_historical_quat(timestamp) else {
+            return;
+        };
+
+        if motion_state != MotionState::Stable {
+            debug!(
+                "Image was captured during movement. Rejecting pointing anchor update to prevent timestamp and rolling shutter artifacts."
+            );
+            return;
+        }
+
+        let mut align = self.alignment.write().unwrap();
+        align.last_camera_position = Some(*camera_pointing);
+        align.imu_anchor_state = Some(hist_q);
+
+        debug!(
+            "IMU pointing anchor successfully updated from low-confidence solve. SVD calibration bypassed."
+        );
     }
 
-    // Clears the active session anchors and telemetry, but strictly preserves
-    // the SVD calibration pool, mount_q, and disk file to support file-less recalibration and
-    // uninterrupted EQ tracking.
-    /// Resets the IMU anchor state, clearing the `last_camera_position`.
+    /// Resets the active session anchors, telemetry, and error history, clearing `last_camera_position`.
+    /// Strictly preserves the SVD calibration pool, `mount_q`, and disk file.
     pub fn reset_anchors(&self) {
         debug!("reset called. Clearing anchors but preserving calibration matrix.");
         let mut align = self.alignment.write().unwrap();
@@ -1000,13 +942,15 @@ impl Imu {
         align.error_history.clear();
     }
 
-    // Clears the entire calibration matrix, history, and deletes the persistent file.
-    /// Clears the 3D calibration between the IMU and camera, resetting `mount_q` to identity.
+    /// Clears the 3D calibration between the IMU and camera, resetting `mount_q` to identity
+    /// and deleting the persistent calibration file from storage.
     pub fn clear_calibration(&self) {
         let mut align = self.alignment.write().unwrap();
         align.mount_q = UnitQuaternion::identity();
         align.calibration_axes.clear();
-        align.loaded_from_disk = false;
+        align.is_locked = false;
+        align.startup_slews_passed = 0;
+        align.startup_strikes = 0;
         align.best_calibration_confidence = 0.0;
 
         if let Some(storage) = self.storage.clone() {
@@ -1018,11 +962,11 @@ impl Imu {
         info!("IMU calibration matrix and history have been cleared.");
     }
 
-    // IMU-derived estimate of camera pointing as of the given time.
-    // The boolean in the Result tuple is `true` if the returned position is an updated estimate
-    // using IMU data, and `false` if it is falling back to the static anchor itself.
     /// Computes the camera's estimated pointing by advancing the last known
     /// camera position using the IMU's rotational delta since the anchor time.
+    ///
+    /// The boolean in the Result tuple is `true` if the returned position is an updated estimate
+    /// using IMU data, and `false` if it is falling back to the static anchor itself.
     pub fn get_estimated_pointing(
         &self,
         timestamp: &SystemTime,
@@ -1032,7 +976,7 @@ impl Imu {
         if let (Some(anchor_horiz), Some(anchor_quat)) =
             (align.last_camera_position, align.imu_anchor_state)
         {
-            if !align.loaded_from_disk && align.calibration_axes.len() < 3 {
+            if !align.is_locked && align.calibration_axes.len() < 3 {
                 return Ok((anchor_horiz, false));
             }
 
@@ -1094,7 +1038,7 @@ impl Imu {
     /// Returns `true` if a full 3D calibration has been established.
     pub fn is_calibrated(&self) -> bool {
         let align = self.alignment.read().unwrap();
-        align.loaded_from_disk
+        align.is_locked
     }
 
     /// Retrieves the latest snapshot of the IMU's orientation and motion state.

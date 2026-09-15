@@ -16,6 +16,12 @@ pub trait PersistentStorage: Send + Sync {
 /// A no-op implementation of `PersistentStorage` that discards saved data.
 pub struct NullStorage;
 
+impl Default for NullStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NullStorage {
     /// Constructs a new `NullStorage`.
     pub fn new() -> Self {

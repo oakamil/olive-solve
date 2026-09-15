@@ -95,7 +95,7 @@ pub fn parse_bmi160_fifo(
             }
         } else if header == 0x40 {
             // Skip frame (Header + 1 byte skip count)
-            if i + 1 <= fifo_data.len() {
+            if i < fifo_data.len() {
                 i += 1;
             } else {
                 break;

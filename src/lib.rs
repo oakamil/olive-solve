@@ -5,23 +5,23 @@
 //! It integrates the `tetra3` solver with hardware sensors (via `olive-imu`) to estimate
 //! sky attitudes quickly and accurately.
 
+use std::sync::{Arc, RwLock};
+use std::time::SystemTime;
+
 use chrono::{Datelike, Timelike};
 use ndarray::{Array2, ArrayBase, Data, Ix2};
 use olive_imu::storage::PersistentStorage;
-use olive_imu::{
-    Imu, ImuDevice, MOVING_CAMERA_DEVIATION_TOLERANCE_DEG, MountCoordinates,
-    STATIONARY_CAMERA_DEVIATION_TOLERANCE_DEG, STATIONARY_MOTION_THRESHOLD_DEG,
-};
-use std::sync::Arc;
-use std::sync::RwLock;
-
-#[cfg(feature = "python")]
-pub mod python;
-use std::time::SystemTime;
+use olive_imu::{Imu, ImuDevice, MountCoordinates, STATIONARY_MOTION_THRESHOLD_DEG};
 use tetra3::FastPixel;
 use tetra3::extractor::{ExtractOptions, ExtractionResult, Extractor};
 use tetra3::fast_extractor::{FastExtractOptions, FastExtractionResult, FastExtractor};
 use tetra3::solver::{Solution, SolveOptions, SolveStatus, Solver};
+
+#[cfg(feature = "python")]
+pub mod python;
+
+/// The maximum angular deviation (in degrees) allowed to accept a low-confidence camera solve.
+pub const LOW_CONFIDENCE_MATCH_DEVIATION_TOLERANCE_DEG: f64 = 10.0;
 
 /// Wrapper to inject custom IMU devices (e.g. for testing)
 pub struct CustomImuWrapper(pub Box<dyn ImuDevice + Send>);
@@ -558,62 +558,21 @@ impl FusedSolver {
         };
 
         if solution.status == SolveStatus::MatchFound {
-            let angle_moved = self.get_rotation_since_last_anchor(&time).unwrap_or(0.0);
-
-            let max_allowed_error_deg = if angle_moved < STATIONARY_MOTION_THRESHOLD_DEG {
-                STATIONARY_CAMERA_DEVIATION_TOLERANCE_DEG // Stationary since last anchor: reject false solves jumping too far
-            } else {
-                MOVING_CAMERA_DEVIATION_TOLERANCE_DEG // Physical slew occurred: tolerate gyro integration drift
-            };
-
-            let is_calibrated = self
-                .imu
-                .read()
-                .unwrap()
-                .as_ref()
-                .map_or(false, |i| i.is_calibrated());
-
-            // SVD Bootstrap Guard: If we are uncalibrated and moving, we MUST accept the solve
-            // in order to build the SVD calibration pool. The IMU cannot reject what it cannot project.
-            let is_valid = if angle_moved >= STATIONARY_MOTION_THRESHOLD_DEG && !is_calibrated {
-                true
-            } else {
-                match self.verify_solution_with_imu(&solution, time, max_allowed_error_deg) {
-                    Some(valid) => valid,
-                    None => true, // Initial bootstrap solve or no IMU: accept
-                }
-            };
-
-            if is_valid {
-                *self.last_solve_failed.write().unwrap() = false;
-                self.update_anchor_from_solution(&solution, time);
-            } else {
-                log::warn!(
-                    "Rejected anomalous MatchFound: solve position deviated > {:.1}° from IMU (angle moved since last anchor: {:.2}°).",
-                    max_allowed_error_deg,
-                    angle_moved
-                );
-                *self.last_solve_failed.write().unwrap() = true;
-                solution.status = SolveStatus::NoMatch;
-            }
+            *self.last_solve_failed.write().unwrap() = false;
+            self.update_anchor_from_solution(&solution, time);
         } else if solution.status == SolveStatus::LowConfidenceMatch {
             // Only accept a low confidence fallback if the IMU can physically verify it
-            // is within a tight 5-degree geometric cone of our expected orientation.
-            let imu_verified = self.verify_solution_with_imu(&solution, time, 5.0);
+            // is within the deviation tolerance.
+            let imu_verified = self.verify_solution_with_imu(
+                &solution,
+                time,
+                LOW_CONFIDENCE_MATCH_DEVIATION_TOLERANCE_DEG,
+            );
 
             match imu_verified {
                 Some(true) => {
                     solution.status = SolveStatus::MatchFound;
                     *self.last_solve_failed.write().unwrap() = false;
-
-                    *self.latest_solve_position.write().unwrap() = Some(Position {
-                        ra: solution.ra.unwrap_or(0.0),
-                        dec: solution.dec.unwrap_or(0.0),
-                        roll: solution.roll.unwrap_or(0.0),
-                        source: PositionSource::Solver,
-                        timestamp: time,
-                    });
-
                     self.update_pointing_anchor_only_from_solution(&solution, time);
                 }
                 Some(false) => {
@@ -762,17 +721,23 @@ impl FusedSolver {
         Ok((solution, extract_time_ms))
     }
 
-    fn update_anchor_from_solution(&self, solution: &Solution, time: SystemTime) {
-        let ra = if let (Some(t_ra), Some(_t_dec)) = (&solution.target_ra, &solution.target_dec) {
-            t_ra[0]
-        } else {
-            solution.ra.unwrap_or(0.0)
-        };
-        let dec = if let (Some(_t_ra), Some(t_dec)) = (&solution.target_ra, &solution.target_dec) {
-            t_dec[0]
-        } else {
-            solution.dec.unwrap_or(0.0)
-        };
+    #[inline]
+    fn extract_pointing_coords(solution: &Solution) -> (f64, f64) {
+        let ra = solution
+            .target_ra
+            .as_ref()
+            .and_then(|v| v.first().copied())
+            .unwrap_or_else(|| solution.ra.unwrap_or(0.0));
+        let dec = solution
+            .target_dec
+            .as_ref()
+            .and_then(|v| v.first().copied())
+            .unwrap_or_else(|| solution.dec.unwrap_or(0.0));
+        (ra, dec)
+    }
+
+    fn update_anchor_internal(&self, solution: &Solution, time: SystemTime, pointing_only: bool) {
+        let (ra, dec) = Self::extract_pointing_coords(solution);
         let roll = solution.roll.unwrap_or(0.0);
 
         if let Some(ref imu) = *self.imu.read().unwrap() {
@@ -789,7 +754,11 @@ impl FusedSolver {
                     yaw: az,
                     roll: alt_az_roll,
                 };
-                imu.update_anchor(&mount_coords, &time);
+                if pointing_only {
+                    imu.update_pointing_anchor_only(&mount_coords, &time);
+                } else {
+                    imu.update_anchor(&mount_coords, &time);
+                }
             }
         }
 
@@ -802,35 +771,12 @@ impl FusedSolver {
         });
     }
 
+    fn update_anchor_from_solution(&self, solution: &Solution, time: SystemTime) {
+        self.update_anchor_internal(solution, time, false);
+    }
+
     fn update_pointing_anchor_only_from_solution(&self, solution: &Solution, time: SystemTime) {
-        let ra = if let (Some(t_ra), Some(_t_dec)) = (&solution.target_ra, &solution.target_dec) {
-            t_ra[0]
-        } else {
-            solution.ra.unwrap_or(0.0)
-        };
-        let dec = if let (Some(_t_ra), Some(t_dec)) = (&solution.target_ra, &solution.target_dec) {
-            t_dec[0]
-        } else {
-            solution.dec.unwrap_or(0.0)
-        };
-        let roll = solution.roll.unwrap_or(0.0);
-
-        if let Some(ref imu) = *self.imu.read().unwrap() {
-            let lat_opt = *self.latitude.read().unwrap();
-            let lon_opt = *self.longitude.read().unwrap();
-
-            if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
-                let dt: chrono::DateTime<chrono::Utc> = time.into();
-                let (alt, az, alt_az_roll) = ra_dec_to_alt_az(ra, dec, roll, lat, lon, dt);
-
-                let mount_coords = MountCoordinates {
-                    pitch: alt,
-                    yaw: az,
-                    roll: alt_az_roll,
-                };
-                imu.update_pointing_anchor_only(&mount_coords, &time);
-            }
-        }
+        self.update_anchor_internal(solution, time, true);
     }
 
     fn verify_solution_with_imu(
@@ -839,16 +785,7 @@ impl FusedSolver {
         time: SystemTime,
         max_dist_deg: f64,
     ) -> Option<bool> {
-        let ra = if let (Some(t_ra), Some(_t_dec)) = (&solution.target_ra, &solution.target_dec) {
-            t_ra[0]
-        } else {
-            solution.ra.unwrap_or(0.0)
-        };
-        let dec = if let (Some(_t_ra), Some(t_dec)) = (&solution.target_ra, &solution.target_dec) {
-            t_dec[0]
-        } else {
-            solution.dec.unwrap_or(0.0)
-        };
+        let (ra, dec) = Self::extract_pointing_coords(solution);
 
         let imu_guard = self.imu.read().unwrap();
         if let Some(ref imu) = *imu_guard {
@@ -1654,7 +1591,7 @@ mod new_tests {
         let t1 = std::time::SystemTime::now();
 
         // The IMU hasn't moved (always returning identity quaternion), so its estimate is still basically 100.0, 50.0.
-        // Let's create a LowConfidenceMatch that is ~2 degrees away (within 5 degree cone).
+        // Let's create a LowConfidenceMatch that is ~2 degrees away (within the tolerance cone).
         let candidate_verified = tetra3::solver::Solution {
             ra: Some(101.5), // ~1.5 degrees away in RA
             dec: Some(51.0), // ~1.0 degrees away in Dec
@@ -1663,108 +1600,36 @@ mod new_tests {
             ..Default::default()
         };
 
-        let verified = fs.verify_solution_with_imu(&candidate_verified, t1, 5.0);
+        let verified = fs.verify_solution_with_imu(
+            &candidate_verified,
+            t1,
+            LOW_CONFIDENCE_MATCH_DEVIATION_TOLERANCE_DEG,
+        );
         assert_eq!(
             verified,
             Some(true),
-            "Candidate should be verified as it is within 5 degrees"
+            "Candidate should be verified as it is within {} degrees",
+            LOW_CONFIDENCE_MATCH_DEVIATION_TOLERANCE_DEG
         );
 
-        // Let's test a candidate that is 10 degrees away
+        // Let's test a candidate that is 20 degrees away to unambiguously fail the 10-degree check.
         let candidate_rejected = tetra3::solver::Solution {
-            ra: Some(110.0),
+            ra: Some(120.0),
             dec: Some(50.0),
             roll: Some(0.0),
             status: tetra3::solver::SolveStatus::LowConfidenceMatch,
             ..Default::default()
         };
-        let rejected = fs.verify_solution_with_imu(&candidate_rejected, t1, 5.0);
+        let rejected = fs.verify_solution_with_imu(
+            &candidate_rejected,
+            t1,
+            LOW_CONFIDENCE_MATCH_DEVIATION_TOLERANCE_DEG,
+        );
         assert_eq!(
             rejected,
             Some(false),
-            "Candidate should be rejected as it is >5 degrees away"
-        );
-    }
-
-    #[test]
-    fn test_imu_stationary_match_found_rejection() {
-        let fs = FusedSolver {
-            solver: Arc::new(RwLock::new(None)),
-            extractor: Arc::new(RwLock::new(None)),
-            fast_extractor: Arc::new(RwLock::new(None)),
-            imu: Arc::new(RwLock::new(None)),
-            imu_type: Arc::new(RwLock::new(ImuType::Custom(Box::new(MockImuWithData)))),
-            storage: None,
-            latest_solve_position: Arc::new(RwLock::new(None)),
-            last_solve_failed: Arc::new(RwLock::new(false)),
-            latitude: Arc::new(RwLock::new(None)),
-            longitude: Arc::new(RwLock::new(None)),
-        };
-
-        fs.set_observer_location(34.0, -118.0);
-        fs.start_imu().unwrap();
-
-        // Let IMU initialize
-        std::thread::sleep(std::time::Duration::from_millis(3100));
-
-        let t0 = std::time::SystemTime::now();
-
-        // Establish initial anchor at RA=100.0, Dec=50.0
-        let anchor_sol = tetra3::solver::Solution {
-            ra: Some(100.0),
-            dec: Some(50.0),
-            roll: Some(0.0),
-            status: tetra3::solver::SolveStatus::MatchFound,
-            ..Default::default()
-        };
-        fs.update_anchor_from_solution(&anchor_sol, t0);
-
-        // IMU reports no motion since last anchor (angle_moved ≈ 0.0)
-        let t1 = std::time::SystemTime::now();
-        let angle_moved = fs.get_rotation_since_last_anchor(&t1).unwrap_or(0.0);
-        assert!(
-            angle_moved < STATIONARY_MOTION_THRESHOLD_DEG,
-            "IMU should report < {}° motion since last anchor",
-            STATIONARY_MOTION_THRESHOLD_DEG
-        );
-
-        // A false MatchFound solve (e.g. from tree leaves) jumping to RA=250.0, Dec=10.0 (155° away)
-        let false_tree_solve = tetra3::solver::Solution {
-            ra: Some(250.0),
-            dec: Some(10.0),
-            roll: Some(0.0),
-            status: tetra3::solver::SolveStatus::MatchFound,
-            ..Default::default()
-        };
-
-        // When stationary, verify should reject this 155° false solve.
-        let max_allowed = if angle_moved < STATIONARY_MOTION_THRESHOLD_DEG {
-            STATIONARY_CAMERA_DEVIATION_TOLERANCE_DEG
-        } else {
-            MOVING_CAMERA_DEVIATION_TOLERANCE_DEG
-        };
-        let is_valid = fs
-            .verify_solution_with_imu(&false_tree_solve, t1, max_allowed)
-            .unwrap_or(true);
-        assert!(
-            !is_valid,
-            "False solve 155° away while stationary must be rejected"
-        );
-
-        // Valid solve 1.0° away while stationary should be accepted
-        let valid_solve = tetra3::solver::Solution {
-            ra: Some(100.5),
-            dec: Some(50.5),
-            roll: Some(0.0),
-            status: tetra3::solver::SolveStatus::MatchFound,
-            ..Default::default()
-        };
-        let is_valid_close = fs
-            .verify_solution_with_imu(&valid_solve, t1, max_allowed)
-            .unwrap_or(false);
-        assert!(
-            is_valid_close,
-            "Valid solve 1° away while stationary must be accepted"
+            "Candidate should be rejected as it is >{} degrees away",
+            LOW_CONFIDENCE_MATCH_DEVIATION_TOLERANCE_DEG
         );
     }
 }

@@ -128,7 +128,6 @@ mod hardware {
                 accel: Some(vec_a),
                 hardware_quaternion: hw_quat,
                 dt: Some(safe_dt),
-                ..Default::default()
             });
 
             Ok(readings)
