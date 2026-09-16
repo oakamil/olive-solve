@@ -313,6 +313,10 @@ mod hardware {
             std::thread::sleep(std::time::Duration::from_millis(100));
             Ok(())
         }
+
+        fn needs_seeding(&self) -> bool {
+            true
+        }
     }
 }
 
@@ -343,6 +347,10 @@ mod stub {
         }
         fn revive(&mut self) -> Result<(), String> {
             Err("Unsupported".into())
+        }
+
+        fn needs_seeding(&self) -> bool {
+            true
         }
     }
 }
