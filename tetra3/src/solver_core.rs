@@ -1168,6 +1168,76 @@ impl Scratchpads {
 // The original tetra3 algorithm seems to have settled on 4 as the optimal pattern size - its name
 // includes 'tetra' after all.
 //
+/// Holds the flattened 4-star catalog array, supporting multiple underlying integer sizes.
+#[derive(Clone, Debug)]
+pub(crate) enum PatternCatalog {
+    /// 8-bit unsigned integer array.
+    U8(Vec<u8>),
+    /// 16-bit unsigned integer array.
+    U16(Vec<u16>),
+    /// 32-bit unsigned integer array.
+    U32(Vec<u32>),
+}
+
+impl PatternCatalog {
+    /// Returns the element at the specified index, cast to `usize`.
+    #[inline(always)]
+    pub fn get(&self, index: usize) -> usize {
+        match self {
+            PatternCatalog::U8(v) => v[index] as usize,
+            PatternCatalog::U16(v) => v[index] as usize,
+            PatternCatalog::U32(v) => v[index] as usize,
+        }
+    }
+
+    /// Returns the length of the underlying array.
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        match self {
+            PatternCatalog::U8(v) => v.len(),
+            PatternCatalog::U16(v) => v.len(),
+            PatternCatalog::U32(v) => v.len(),
+        }
+    }
+
+    /// Retrieves the four star indices starting at `row_start` and writes them into `out`.
+    #[inline(always)]
+    pub fn get_pattern_stars(&self, row_start: usize, out: &mut [usize; 4]) {
+        match self {
+            PatternCatalog::U8(v) => {
+                let chunk: &[u8; 4] = v[row_start..row_start + 4].try_into().unwrap();
+                out[0] = chunk[0] as usize;
+                out[1] = chunk[1] as usize;
+                out[2] = chunk[2] as usize;
+                out[3] = chunk[3] as usize;
+            }
+            PatternCatalog::U16(v) => {
+                let chunk: &[u16; 4] = v[row_start..row_start + 4].try_into().unwrap();
+                out[0] = chunk[0] as usize;
+                out[1] = chunk[1] as usize;
+                out[2] = chunk[2] as usize;
+                out[3] = chunk[3] as usize;
+            }
+            PatternCatalog::U32(v) => {
+                let chunk: &[u32; 4] = v[row_start..row_start + 4].try_into().unwrap();
+                out[0] = chunk[0] as usize;
+                out[1] = chunk[1] as usize;
+                out[2] = chunk[2] as usize;
+                out[3] = chunk[3] as usize;
+            }
+        }
+    }
+}
+
+/// Stores the largest angular edge lengths for patterns, supporting native `f16` storage for memory reduction.
+#[derive(Clone, Debug)]
+pub(crate) enum PatternEdge {
+    /// 16-bit half-precision floating point array.
+    F16(Vec<half::f16>),
+    /// 32-bit single-precision floating point array.
+    F32(Vec<f32>),
+}
+
 /// The main solver engine. Highly optimized for plate solving using cedar-solve databases.
 pub struct Solver {
     /// Unit vectors `[x, y, z]` for all stars in the loaded catalog.
@@ -1175,13 +1245,13 @@ pub struct Solver {
     /// Metadata (RA, Dec, magnitude) for each star in the catalog.
     pub star_metadata: Vec<StarMetadata>,
     /// Flattened 4-star catalog index array.
-    pub pattern_catalog_flat: Vec<u32>,
+    pub(crate) pattern_catalog_flat: PatternCatalog,
     /// Hash probe table mapping hash indices to catalog entries.
     pub probe_table: Vec<u16>,
     /// 3D k-d tree spatial index over catalog star unit vectors for rapid neighborhood queries.
     pub star_kd_tree: ImmutableKdTree<Flt, 3>,
     /// Largest angular edge length for each catalog pattern.
-    pub pattern_largest_edge: Option<Vec<f32>>,
+    pub(crate) pattern_largest_edge: Option<PatternEdge>,
     /// True if the database contains precomputed pattern key hashes.
     pub has_pattern_key_hashes: bool,
     /// External catalog star identifiers, if present in the database.
@@ -1235,7 +1305,7 @@ impl Solver {
         let read_pattern_catalog =
             |arc: &mut ZipArchive<File>,
              name: &str|
-             -> Result<(Vec<u32>, usize), Box<dyn std::error::Error>> {
+             -> Result<(PatternCatalog, usize), Box<dyn std::error::Error>> {
                 let mut zf = arc.by_name(name)?;
                 let mut buf = Vec::new();
                 zf.read_to_end(&mut buf)?;
@@ -1252,8 +1322,7 @@ impl Solver {
                 let mut cursor = Cursor::new(&buf);
                 if let Ok(npy) = NpyFile::new(&mut cursor) {
                     if let Ok(data_u8) = npy.into_vec::<u8>() {
-                        let data: Vec<u32> = data_u8.into_iter().map(|v| v as u32).collect();
-                        return Ok((data, nrows));
+                        return Ok((PatternCatalog::U8(data_u8), nrows));
                     }
                 }
 
@@ -1261,8 +1330,7 @@ impl Solver {
                 let mut cursor = Cursor::new(&buf);
                 if let Ok(npy) = NpyFile::new(&mut cursor) {
                     if let Ok(data_u16) = npy.into_vec::<u16>() {
-                        let data: Vec<u32> = data_u16.into_iter().map(|v| v as u32).collect();
-                        return Ok((data, nrows));
+                        return Ok((PatternCatalog::U16(data_u16), nrows));
                     }
                 }
 
@@ -1270,17 +1338,28 @@ impl Solver {
                 let mut cursor = Cursor::new(&buf);
                 let npy = NpyFile::new(&mut cursor)?;
                 let data_u32: Vec<u32> = npy.into_vec()?;
-                Ok((data_u32, nrows))
+                Ok((PatternCatalog::U32(data_u32), nrows))
             };
 
-        let read_1d_f16_to_f32 = |arc: &mut ZipArchive<File>, name: &str| -> Option<Vec<f32>> {
+        let read_pattern_edge = |arc: &mut ZipArchive<File>, name: &str| -> Option<PatternEdge> {
             arc.by_name(name).ok().and_then(|mut zf| {
                 let mut buf = Vec::new();
                 zf.read_to_end(&mut buf).ok()?;
+                
                 let mut cursor = Cursor::new(&buf);
-                let npy = NpyFile::new(&mut cursor).ok()?;
-                let vec_f16: Vec<half::f16> = npy.into_vec().ok()?;
-                Some(vec_f16.into_iter().map(|f| f.to_f32()).collect())
+                if let Ok(npy) = NpyFile::new(&mut cursor) {
+                    if let Ok(vec_f16) = npy.into_vec::<half::f16>() {
+                        return Some(PatternEdge::F16(vec_f16));
+                    }
+                }
+                
+                let mut cursor = Cursor::new(&buf);
+                if let Ok(npy) = NpyFile::new(&mut cursor) {
+                    if let Ok(vec_f32) = npy.into_vec::<f32>() {
+                        return Some(PatternEdge::F32(vec_f32));
+                    }
+                }
+                None
             })
         };
 
@@ -1347,7 +1426,7 @@ impl Solver {
         let (pattern_catalog_flat, num_patterns_from_arr) =
             read_pattern_catalog(&mut archive, "pattern_catalog.npy")?;
         let star_table_data = read_star_table(&mut archive, "star_table.npy")?;
-        let pattern_largest_edge = read_1d_f16_to_f32(&mut archive, "pattern_largest_edge.npy");
+        let pattern_largest_edge = read_pattern_edge(&mut archive, "pattern_largest_edge.npy");
         let pattern_key_hashes = read_1d_u16(&mut archive, "pattern_key_hashes.npy");
         let star_catalog_ids = read_star_catalog_ids(&mut archive, "star_catalog_IDs.npy");
 
@@ -1371,10 +1450,10 @@ impl Solver {
 
         for i in 0..num_patterns_allocated {
             let row_start = i * 4;
-            if pattern_catalog_flat[row_start] == 0
-                && pattern_catalog_flat[row_start + 1] == 0
-                && pattern_catalog_flat[row_start + 2] == 0
-                && pattern_catalog_flat[row_start + 3] == 0
+            if pattern_catalog_flat.get(row_start) == 0
+                && pattern_catalog_flat.get(row_start + 1) == 0
+                && pattern_catalog_flat.get(row_start + 2) == 0
+                && pattern_catalog_flat.get(row_start + 3) == 0
             {
                 probe_table.push(u16::MAX);
             } else {
@@ -1620,11 +1699,11 @@ impl Solver {
         inv_largest_edge: Flt,
         fov_estimate: Option<Flt>,
         fov_max_error: Option<Flt>,
-        pattern_catalog_flat: &[u32],
+        pattern_catalog_flat: &PatternCatalog,
         probe_table: &[u16],
         p_size: usize,
         has_pattern_key_hashes: bool,
-        pattern_largest_edge: &Option<Vec<f32>>,
+        pattern_largest_edge: &Option<PatternEdge>,
         star_vectors: &[[Flt; 3]],
         linear_probe: bool,
         sp_hash_match_inds: &mut Vec<usize>,
@@ -1654,11 +1733,25 @@ impl Solver {
             (pattern_largest_edge, fov_estimate, fov_max_error)
         {
             let fov_factor = f_est * (0.001 as Flt) * inv_largest_edge;
-            sp_hash_match_inds.retain(|&idx| {
-                let cat_largest_edge = largest_edges[idx] as Flt;
-                let fov2 = cat_largest_edge * fov_factor;
-                (fov2 - f_est).abs() < f_err
-            });
+            match largest_edges {
+                PatternEdge::F32(edges) => {
+                    sp_hash_match_inds.retain(|&idx| {
+                        let cat_largest_edge = edges[idx] as Flt;
+                        let fov2 = cat_largest_edge * fov_factor;
+                        (fov2 - f_est).abs() < f_err
+                    });
+                }
+                PatternEdge::F16(edges) => {
+                    let fov_min = ((f_est - f_err) / fov_factor).max(0.0) as f32;
+                    let fov_max = ((f_est + f_err) / fov_factor) as f32;
+                    let min_f16_bits = half::f16::from_f32(fov_min).to_bits();
+                    let max_f16_bits = half::f16::from_f32(fov_max).to_bits();
+                    sp_hash_match_inds.retain(|&idx| {
+                        let e_bits = edges[idx].to_bits();
+                        e_bits >= min_f16_bits && e_bits <= max_f16_bits
+                    });
+                }
+            }
         }
 
         let num_matches = sp_hash_match_inds.len();
@@ -1671,13 +1764,13 @@ impl Solver {
         out_edges.truncate(num_matches);
         out_vectors.truncate(num_matches);
 
+        let mut star_ids = [0usize; 4];
         for (out_idx, &idx) in sp_hash_match_inds.iter().enumerate() {
             let row_start = idx * p_size;
             let vecs = &mut out_vectors[out_idx];
+            pattern_catalog_flat.get_pattern_stars(row_start, &mut star_ids);
             for i in 0..p_size {
-                let star_id = pattern_catalog_flat[row_start + i] as usize;
-                let v = star_vectors[star_id];
-                vecs[i] = v;
+                vecs[i] = star_vectors[star_ids[i]];
             }
 
             let edges_vec = &mut out_edges[out_idx];

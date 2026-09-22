@@ -1153,6 +1153,9 @@ fn test_optical_center_override() {
         panic!("missing");
     };
 
+    assert!((tra[0] - base_ra).abs() < 1e-6);
+    assert!((tdec[0] - base_dec).abs() < 1e-6);
+
     let ovr_options = SolveOptions {
         fov_estimate: input_dto.options.fov_estimate,
         optical_center_override: Some([h / 2.0, w / 2.0]),
