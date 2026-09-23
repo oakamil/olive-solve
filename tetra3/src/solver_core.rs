@@ -553,14 +553,18 @@ fn verify_and_build_solution(
 
     // Epsilon to capture borders safely across both f32 and f64 pipelines
     let max_dist_sq = distance_from_angle(fov_diagonal_rad / (2.0 as Flt)).powi(2) + (1e-8 as Flt);
-    // OPTIMIZATION: Allocation-Free KD-Tree Parsing (Eliminated .collect() vector allocations)
-    let mut nearby_nodes =
-        star_kd_tree.within_unsorted::<SquaredEuclidean>(&image_center_vector, max_dist_sq);
+    // OPTIMIZATION: Allocation-Free KD-Tree Parsing using Kiddo 6.3.0
+    scratch.sp_kept.clear();
+    star_kd_tree
+        .query(&image_center_vector)
+        .within::<SquaredEuclidean<Flt>>(max_dist_sq)
+        .unsorted()
+        .visit(|node| scratch.sp_kept.push(node.item as usize));
 
     // Re-sort KDTree return list by index to prioritize brighter stars exactly like Python
-    nearby_nodes.sort_unstable_by_key(|n| n.item);
+    scratch.sp_kept.sort_unstable();
 
-    let num_nearby = nearby_nodes.len();
+    let num_nearby = scratch.sp_kept.len();
     if num_nearby == 0 {
         return VerificationResult::None;
     }
@@ -585,8 +589,7 @@ fn verify_and_build_solution(
     let r = rotation_matrix;
     let mut crop_len = 0;
 
-    for node in &nearby_nodes {
-        let star_idx = node.item as usize;
+    for &star_idx in &scratch.sp_kept {
         let vec = star_vectors[star_idx];
 
         let v0 =
@@ -1345,14 +1348,14 @@ impl Solver {
             arc.by_name(name).ok().and_then(|mut zf| {
                 let mut buf = Vec::new();
                 zf.read_to_end(&mut buf).ok()?;
-                
+
                 let mut cursor = Cursor::new(&buf);
                 if let Ok(npy) = NpyFile::new(&mut cursor) {
                     if let Ok(vec_f16) = npy.into_vec::<half::f16>() {
                         return Some(PatternEdge::F16(vec_f16));
                     }
                 }
-                
+
                 let mut cursor = Cursor::new(&buf);
                 if let Ok(npy) = NpyFile::new(&mut cursor) {
                     if let Ok(vec_f32) = npy.into_vec::<f32>() {
@@ -1473,7 +1476,7 @@ impl Solver {
         for vec in star_vectors.iter() {
             points.push(*vec);
         }
-        let star_kd_tree = ImmutableKdTree::new_from_slice(&points);
+        let star_kd_tree = ImmutableKdTree::new_from_slice(&points).unwrap();
 
         let mut num_patterns = num_patterns_from_arr / 2;
         let mut db_props = HashMap::new();
@@ -1848,11 +1851,14 @@ impl Solver {
 
         let max_dist_sq =
             distance_from_angle(fov_diagonal_rad / (2.0 as Flt)).powi(2) + (1e-8 as Flt);
-        let mut nearby_nodes = self
-            .star_kd_tree
-            .within_unsorted::<SquaredEuclidean>(&image_center_vector, max_dist_sq);
+        let mut nearby_nodes = Vec::new();
+        self.star_kd_tree
+            .query(&image_center_vector)
+            .within::<SquaredEuclidean<Flt>>(max_dist_sq)
+            .unsorted()
+            .visit(|node| nearby_nodes.push(node.item as usize));
 
-        nearby_nodes.sort_unstable_by_key(|n| n.item);
+        nearby_nodes.sort_unstable();
 
         let num_nearby = nearby_nodes.len();
         if num_nearby == 0 {
@@ -1867,8 +1873,7 @@ impl Solver {
 
         let mut valid_cat_centroids = Vec::with_capacity(nearby_nodes.len());
 
-        for node in &nearby_nodes {
-            let star_idx = node.item as usize;
+        for &star_idx in &nearby_nodes {
             let vec = self.star_vectors[star_idx];
 
             let v0 = (r[(0, 0)] as Flt) * vec[0]
