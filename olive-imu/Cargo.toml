@@ -9,7 +9,7 @@ nalgebra = "0.32"
 
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-bmi160 = { git = "https://github.com/oakamil/bmi160-rs.git" }
+bmi160 = { path = "../../bmi160-rs" }
 bno055 = "0.4.0"
 bno080 = { git = "https://github.com/oakamil/bno080.git", branch = "arvr" }
 embedded-hal = "1.0.0"

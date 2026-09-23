@@ -128,6 +128,7 @@ pub struct FusedSolver {
     storage: Option<Arc<dyn PersistentStorage>>,
     latest_solve_position: Arc<RwLock<Option<Position>>>,
     last_solve_failed: Arc<RwLock<bool>>,
+    enable_accel: bool,
 
     // Observer location required for Alt/Az IMU coordinate mapping
     latitude: Arc<RwLock<Option<f64>>>,
@@ -152,6 +153,7 @@ impl FusedSolver {
         database_path: &std::path::Path,
         imu_type: Option<ImuType>,
         storage: Option<Arc<dyn PersistentStorage>>,
+        enable_accel: bool,
     ) -> Result<Self, String> {
         let solver = Solver::load_database(database_path)
             .map_err(|e| format!("Failed to load database: {:?}", e))?;
@@ -166,6 +168,7 @@ impl FusedSolver {
             storage,
             latest_solve_position: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
+            enable_accel,
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         })
@@ -189,69 +192,100 @@ impl FusedSolver {
             ImuType::None => return Err("Cannot start IMU because ImuType is None.".into()),
             ImuType::Auto => {
                 // Try Bno085 primary/alt
-                if let Ok(dev) = olive_imu::bno085::Bno085Device::new(10, 0x4A, true, Some(3)) {
-                    Some(Imu::start(dev, self.storage.clone())?)
-                } else if let Ok(dev) =
-                    olive_imu::bno085::Bno085Device::new(10, 0x4B, true, Some(3))
+                if let Ok(dev) =
+                    olive_imu::bno085::Bno085Device::new(10, 0x4A, true, Some(3), self.enable_accel)
                 {
                     Some(Imu::start(dev, self.storage.clone())?)
-                } else if let Ok(dev) = olive_imu::bno085::Bno085Device::new(10, 0x4A, true, None) {
+                } else if let Ok(dev) =
+                    olive_imu::bno085::Bno085Device::new(10, 0x4B, true, Some(3), self.enable_accel)
+                {
                     Some(Imu::start(dev, self.storage.clone())?)
-                } else if let Ok(dev) = olive_imu::bno085::Bno085Device::new(10, 0x4B, true, None) {
+                } else if let Ok(dev) =
+                    olive_imu::bno085::Bno085Device::new(10, 0x4A, true, None, self.enable_accel)
+                {
                     Some(Imu::start(dev, self.storage.clone())?)
-                } else if let Ok(dev) = olive_imu::bno055::Bno055Device::new(10, 0x28) {
+                } else if let Ok(dev) =
+                    olive_imu::bno085::Bno085Device::new(10, 0x4B, true, None, self.enable_accel)
+                {
                     Some(Imu::start(dev, self.storage.clone())?)
-                } else if let Ok(dev) = olive_imu::bno055::Bno055Device::new(10, 0x29) {
+                } else if let Ok(dev) =
+                    olive_imu::bno055::Bno055Device::new(10, 0x28, self.enable_accel)
+                {
                     Some(Imu::start(dev, self.storage.clone())?)
-                } else if let Ok(dev) = olive_imu::bmi160::Bmi160Device::new(0x68) {
+                } else if let Ok(dev) =
+                    olive_imu::bno055::Bno055Device::new(10, 0x29, self.enable_accel)
+                {
                     Some(Imu::start(dev, self.storage.clone())?)
-                } else if let Ok(dev) = olive_imu::bmi160::Bmi160Device::new(0x69) {
+                } else if let Ok(dev) =
+                    olive_imu::bmi160::Bmi160Device::new(0x68, self.enable_accel)
+                {
                     Some(Imu::start(dev, self.storage.clone())?)
-                } else if let Ok(dev) = olive_imu::mpuxxxx::MpuXxxxDevice::new(10, 0x68) {
+                } else if let Ok(dev) =
+                    olive_imu::bmi160::Bmi160Device::new(0x69, self.enable_accel)
+                {
                     Some(Imu::start(dev, self.storage.clone())?)
-                } else if let Ok(dev) = olive_imu::mpuxxxx::MpuXxxxDevice::new(10, 0x69) {
+                } else if let Ok(dev) =
+                    olive_imu::mpuxxxx::MpuXxxxDevice::new(10, 0x68, self.enable_accel)
+                {
+                    Some(Imu::start(dev, self.storage.clone())?)
+                } else if let Ok(dev) =
+                    olive_imu::mpuxxxx::MpuXxxxDevice::new(10, 0x69, self.enable_accel)
+                {
                     Some(Imu::start(dev, self.storage.clone())?)
                 } else {
                     return Err("Auto mode could not find any supported IMU hardware.".into());
                 }
             }
             ImuType::Bno085 => {
-                if let Ok(dev) = olive_imu::bno085::Bno085Device::new(10, 0x4A, true, Some(3)) {
-                    Some(Imu::start(dev, self.storage.clone())?)
-                } else if let Ok(dev) =
-                    olive_imu::bno085::Bno085Device::new(10, 0x4B, true, Some(3))
+                if let Ok(dev) =
+                    olive_imu::bno085::Bno085Device::new(10, 0x4A, true, Some(3), self.enable_accel)
                 {
                     Some(Imu::start(dev, self.storage.clone())?)
-                } else if let Ok(dev) = olive_imu::bno085::Bno085Device::new(10, 0x4A, true, None) {
+                } else if let Ok(dev) =
+                    olive_imu::bno085::Bno085Device::new(10, 0x4B, true, Some(3), self.enable_accel)
+                {
                     Some(Imu::start(dev, self.storage.clone())?)
-                } else if let Ok(dev) = olive_imu::bno085::Bno085Device::new(10, 0x4B, true, None) {
+                } else if let Ok(dev) =
+                    olive_imu::bno085::Bno085Device::new(10, 0x4A, true, None, self.enable_accel)
+                {
+                    Some(Imu::start(dev, self.storage.clone())?)
+                } else if let Ok(dev) =
+                    olive_imu::bno085::Bno085Device::new(10, 0x4B, true, None, self.enable_accel)
+                {
                     Some(Imu::start(dev, self.storage.clone())?)
                 } else {
                     return Err("BNO085 hardware not found on I2C bus.".into());
                 }
             }
             ImuType::Bno055 => {
-                if let Ok(dev) = olive_imu::bno055::Bno055Device::new(10, 0x28) {
+                if let Ok(dev) = olive_imu::bno055::Bno055Device::new(10, 0x28, self.enable_accel) {
                     Some(Imu::start(dev, self.storage.clone())?)
-                } else if let Ok(dev) = olive_imu::bno055::Bno055Device::new(10, 0x29) {
+                } else if let Ok(dev) =
+                    olive_imu::bno055::Bno055Device::new(10, 0x29, self.enable_accel)
+                {
                     Some(Imu::start(dev, self.storage.clone())?)
                 } else {
                     return Err("BNO055 hardware not found on I2C bus.".into());
                 }
             }
             ImuType::Bmi160 => {
-                if let Ok(dev) = olive_imu::bmi160::Bmi160Device::new(0x68) {
+                if let Ok(dev) = olive_imu::bmi160::Bmi160Device::new(0x68, self.enable_accel) {
                     Some(Imu::start(dev, self.storage.clone())?)
-                } else if let Ok(dev) = olive_imu::bmi160::Bmi160Device::new(0x69) {
+                } else if let Ok(dev) =
+                    olive_imu::bmi160::Bmi160Device::new(0x69, self.enable_accel)
+                {
                     Some(Imu::start(dev, self.storage.clone())?)
                 } else {
                     return Err("BMI160 hardware not found on I2C bus.".into());
                 }
             }
             ImuType::MpuXxxx => {
-                if let Ok(dev) = olive_imu::mpuxxxx::MpuXxxxDevice::new(10, 0x68) {
+                if let Ok(dev) = olive_imu::mpuxxxx::MpuXxxxDevice::new(10, 0x68, self.enable_accel)
+                {
                     Some(Imu::start(dev, self.storage.clone())?)
-                } else if let Ok(dev) = olive_imu::mpuxxxx::MpuXxxxDevice::new(10, 0x69) {
+                } else if let Ok(dev) =
+                    olive_imu::mpuxxxx::MpuXxxxDevice::new(10, 0x69, self.enable_accel)
+                {
                     Some(Imu::start(dev, self.storage.clone())?)
                 } else {
                     return Err("MPU sensor hardware not found on I2C bus.".into());
@@ -1086,6 +1120,7 @@ mod tests {
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
+            enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         };
@@ -1109,6 +1144,7 @@ mod tests {
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
+            enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         };
@@ -1132,6 +1168,7 @@ mod tests {
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
+            enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         };
@@ -1151,6 +1188,7 @@ mod tests {
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
+            enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         };
@@ -1175,6 +1213,7 @@ mod tests {
                 timestamp: std::time::SystemTime::UNIX_EPOCH,
             }))),
             last_solve_failed: Arc::new(RwLock::new(false)),
+            enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         };
@@ -1223,6 +1262,7 @@ mod tests {
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
+            enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         };
@@ -1261,6 +1301,7 @@ mod tests {
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
+            enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         };
@@ -1289,6 +1330,7 @@ mod tests {
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
+            enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         };
@@ -1313,6 +1355,7 @@ mod tests {
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
+            enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         };
@@ -1347,7 +1390,7 @@ mod tests {
         }
 
         let _solver = Solver::load_database(db_path).expect("Failed to load Tetra3 database");
-        let fs = FusedSolver::new(db_path, None, None).unwrap();
+        let fs = FusedSolver::new(db_path, None, None, true).unwrap();
 
         let zip_file = File::open(zip_path).expect("Failed to open solver_fixtures.zip");
         let mut archive = ZipArchive::new(zip_file).expect("Failed to open zip archive");
@@ -1564,6 +1607,7 @@ mod new_tests {
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
+            enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
             longitude: Arc::new(RwLock::new(None)),
         };

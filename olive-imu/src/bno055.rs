@@ -17,10 +17,15 @@ mod hardware {
         delay: Delay,
         report_interval_ms: u16,
         last_system_time: Option<SystemTime>,
+        enable_accel: bool,
     }
 
     impl Bno055Device {
-        pub fn new(report_interval_ms: u16, address: u8) -> Result<Self, String> {
+        pub fn new(
+            report_interval_ms: u16,
+            address: u8,
+            enable_accel: bool,
+        ) -> Result<Self, String> {
             info!(
                 "Initializing BNO055 hardware over I2C at address 0x{:X}...",
                 address
@@ -43,13 +48,18 @@ mod hardware {
             imu.init(&mut delay)
                 .map_err(|e| format!("Failed to initialize BNO055 over I2C: {:?}", e))?;
 
-            // Set mode to NDOF
-            imu.set_mode(BNO055OperationMode::NDOF, &mut delay)
-                .map_err(|e| format!("Failed to set BNO055 mode to NDOF: {:?}", e))?;
+            let mode = if enable_accel {
+                BNO055OperationMode::NDOF
+            } else {
+                BNO055OperationMode::GYRO_ONLY
+            };
+
+            imu.set_mode(mode, &mut delay)
+                .map_err(|e| format!("Failed to set BNO055 mode to {:?}: {:?}", mode, e))?;
 
             info!(
-                "Hardware initialized at {}ms using NDOF mode.",
-                report_interval_ms
+                "Hardware initialized at {}ms using {:?} mode.",
+                report_interval_ms, mode
             );
 
             Ok(Self {
@@ -57,6 +67,7 @@ mod hardware {
                 delay,
                 report_interval_ms,
                 last_system_time: None,
+                enable_accel,
             })
         }
     }
@@ -74,11 +85,6 @@ mod hardware {
             let gyro_data = match self.imu.gyro_data() {
                 Ok(data) => data,
                 Err(_) => return Ok(readings), // If read fails, return empty to let caller handle watchdog
-            };
-
-            let accel_data = match self.imu.accel_data() {
-                Ok(data) => data,
-                Err(_) => return Ok(readings),
             };
 
             let now = SystemTime::now();
@@ -103,29 +109,38 @@ mod hardware {
             let wz = gyro_data.z as f64 * to_rad;
             let vec_g = Vector3::new(wx, wy, wz);
 
-            let ax = accel_data.x as f64;
-            let ay = accel_data.y as f64;
-            let az = accel_data.z as f64;
-            let vec_a = Vector3::new(ax, ay, az);
+            let (vec_a, hw_quat) = if self.enable_accel {
+                let accel_data = match self.imu.accel_data() {
+                    Ok(data) => data,
+                    Err(_) => return Ok(readings),
+                };
+                let ax = accel_data.x as f64;
+                let ay = accel_data.y as f64;
+                let az = accel_data.z as f64;
+                let vec_a = Vector3::new(ax, ay, az);
 
-            let hw_quat = if let Ok(q) = self.imu.quaternion() {
-                if q.s != 0.0 || q.v.x != 0.0 || q.v.y != 0.0 || q.v.z != 0.0 {
-                    Some(UnitQuaternion::new_normalize(Quaternion::new(
-                        q.s as f64,
-                        q.v.x as f64,
-                        q.v.y as f64,
-                        q.v.z as f64,
-                    )))
+                let hw_quat = if let Ok(q) = self.imu.quaternion() {
+                    if q.s != 0.0 || q.v.x != 0.0 || q.v.y != 0.0 || q.v.z != 0.0 {
+                        Some(UnitQuaternion::new_normalize(Quaternion::new(
+                            q.s as f64,
+                            q.v.x as f64,
+                            q.v.y as f64,
+                            q.v.z as f64,
+                        )))
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
+                };
+                (Some(vec_a), hw_quat)
             } else {
-                None
+                (None, None)
             };
 
             readings.push(SensorEvent {
                 gyro: Some(vec_g),
-                accel: Some(vec_a),
+                accel: vec_a,
                 hardware_quaternion: hw_quat,
                 dt: Some(safe_dt),
             });
@@ -135,8 +150,13 @@ mod hardware {
 
         fn revive(&mut self) -> Result<(), String> {
             warn!("Sensor unresponsive. Sending hardware revive command...");
+            let mode = if self.enable_accel {
+                BNO055OperationMode::NDOF
+            } else {
+                BNO055OperationMode::GYRO_ONLY
+            };
             self.imu
-                .set_mode(BNO055OperationMode::NDOF, &mut self.delay)
+                .set_mode(mode, &mut self.delay)
                 .map_err(|e| format!("Failed to revive: {:?}", e))?;
             Ok(())
         }
@@ -156,7 +176,7 @@ mod stub {
 
     impl Bno055Device {
         /// Creates a new `Bno055Device`.
-        pub fn new(_interval: u16, _address: u8) -> Result<Self, String> {
+        pub fn new(_interval: u16, _address: u8, _enable_accel: bool) -> Result<Self, String> {
             Err("Hardware I2C is only supported on Linux/Android".into())
         }
     }

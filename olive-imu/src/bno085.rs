@@ -19,6 +19,7 @@ mod hardware {
         report_interval_ms: u16,
         use_calibrated: bool,
         last_poll_time: Option<SystemTime>,
+        enable_accel: bool,
     }
 
     impl Bno085Device {
@@ -27,6 +28,7 @@ mod hardware {
             address: u8,
             use_calibrated: bool,
             i2c_bus: Option<u8>,
+            enable_accel: bool,
         ) -> Result<Self, String> {
             let bus = i2c_bus.unwrap_or(1);
             let bus_path = format!("/dev/i2c-{}", bus);
@@ -58,13 +60,15 @@ mod hardware {
 
             std::thread::sleep(Duration::from_millis(50));
 
-            imu.enable_accelerometer(report_interval_ms)
-                .map_err(|e| format!("Failed to enable Accelerometer: {:?}", e))?;
+            if enable_accel {
+                imu.enable_accelerometer(report_interval_ms)
+                    .map_err(|e| format!("Failed to enable Accelerometer: {:?}", e))?;
 
-            std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(50));
 
-            imu.enable_rotation_vector(report_interval_ms)
-                .map_err(|e| format!("Failed to enable Rotation Vector: {:?}", e))?;
+                imu.enable_rotation_vector(report_interval_ms)
+                    .map_err(|e| format!("Failed to enable Rotation Vector: {:?}", e))?;
+            }
 
             info!(
                 "Hardware initialized at {}ms using {} Gyroscope.",
@@ -77,6 +81,7 @@ mod hardware {
                 report_interval_ms,
                 use_calibrated,
                 last_poll_time: None,
+                enable_accel,
             })
         }
     }
@@ -217,13 +222,15 @@ mod hardware {
                     .map_err(|e| format!("Failed to revive: {:?}", e))?;
             }
             std::thread::sleep(Duration::from_millis(50));
-            self.imu
-                .enable_accelerometer(self.report_interval_ms)
-                .map_err(|e| format!("Failed to revive accel: {:?}", e))?;
-            std::thread::sleep(Duration::from_millis(50));
-            self.imu
-                .enable_rotation_vector(self.report_interval_ms)
-                .map_err(|e| format!("Failed to revive rotation vector: {:?}", e))?;
+            if self.enable_accel {
+                self.imu
+                    .enable_accelerometer(self.report_interval_ms)
+                    .map_err(|e| format!("Failed to revive accel: {:?}", e))?;
+                std::thread::sleep(Duration::from_millis(50));
+                self.imu
+                    .enable_rotation_vector(self.report_interval_ms)
+                    .map_err(|e| format!("Failed to revive rotation vector: {:?}", e))?;
+            }
             Ok(())
         }
     }
@@ -293,6 +300,7 @@ mod stub {
             _address: u8,
             _calib: bool,
             _i2c_bus: Option<u8>,
+            _enable_accel: bool,
         ) -> Result<Self, String> {
             Err("Hardware I2C is only supported on Linux/Android".into())
         }

@@ -14,10 +14,15 @@ mod hardware {
         mpu: Mpu6050<I2cdev>,
         report_interval_ms: u16,
         last_system_time: Option<SystemTime>,
+        enable_accel: bool,
     }
 
     impl MpuXxxxDevice {
-        pub fn new(report_interval_ms: u16, addr_u8: u8) -> Result<Self, String> {
+        pub fn new(
+            report_interval_ms: u16,
+            addr_u8: u8,
+            enable_accel: bool,
+        ) -> Result<Self, String> {
             info!(
                 "Initializing MPU series hardware over I2C at address 0x{:X}...",
                 addr_u8
@@ -50,6 +55,7 @@ mod hardware {
                 mpu,
                 report_interval_ms,
                 last_system_time: None,
+                enable_accel,
             })
         }
     }
@@ -90,16 +96,24 @@ mod hardware {
             let wz = (raw.gyro[2] as f64 / scale) * deg2rad;
             let vec_g = Vector3::new(wx, wy, wz);
 
-            // Convert accel to m/s^2. MPU6050 default accel scale is +-2g (16384 LSB/g)
-            let accel_scale = 16384.0 / 9.81;
-            let ax = raw.accel[0] as f64;
-            let ay = raw.accel[1] as f64;
-            let az = raw.accel[2] as f64;
-            let vec_a = Vector3::new(ax / accel_scale, ay / accel_scale, az / accel_scale);
+            let vec_a = if self.enable_accel {
+                // Convert accel to m/s^2. MPU6050 default accel scale is +-2g (16384 LSB/g)
+                let accel_scale = 16384.0 / 9.81;
+                let ax = raw.accel[0] as f64;
+                let ay = raw.accel[1] as f64;
+                let az = raw.accel[2] as f64;
+                Some(Vector3::new(
+                    ax / accel_scale,
+                    ay / accel_scale,
+                    az / accel_scale,
+                ))
+            } else {
+                None
+            };
 
             readings.push(SensorEvent {
                 gyro: Some(vec_g),
-                accel: Some(vec_a),
+                accel: vec_a,
                 dt: Some(safe_dt),
                 ..Default::default()
             });
@@ -139,7 +153,7 @@ mod stub {
 
     // Use a generic type or u8 to avoid pulling in the driver
     impl MpuXxxxDevice {
-        pub fn new(_interval: u16, _address: u8) -> Result<Self, String> {
+        pub fn new(_interval: u16, _address: u8, _enable_accel: bool) -> Result<Self, String> {
             Err("Hardware I2C is only supported on Linux/Android".into())
         }
     }

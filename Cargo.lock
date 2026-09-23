@@ -373,6 +373,13 @@ dependencies = [
 [[package]]
 name = "bmi160"
 version = "1.1.0"
+dependencies = [
+ "embedded-hal",
+]
+
+[[package]]
+name = "bmi160"
+version = "1.1.0"
 source = "git+https://github.com/oakamil/bmi160-rs.git#41d9bf119520005563f00463d0fb0b2edb94ebc0"
 dependencies = [
  "embedded-hal",
@@ -2232,7 +2239,7 @@ dependencies = [
 name = "olive-imu"
 version = "0.1.0"
 dependencies = [
- "bmi160",
+ "bmi160 1.1.0",
  "bno055",
  "bno080",
  "embedded-hal",
@@ -2249,7 +2256,7 @@ dependencies = [
 name = "olive-solve"
 version = "0.1.0"
 dependencies = [
- "bmi160",
+ "bmi160 1.1.0 (git+https://github.com/oakamil/bmi160-rs.git)",
  "bno080",
  "chrono",
  "log",

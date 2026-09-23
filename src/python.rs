@@ -16,13 +16,14 @@ pub struct PyFusedSolver {
 #[pymethods]
 impl PyFusedSolver {
     #[new]
-    #[pyo3(signature = (database_path, imu_type=None))]
+    #[pyo3(signature = (database_path, imu_type=None, enable_accel=true))]
     /// Initializes a new FusedSolver instance.
     ///
     /// Args:
     ///     database_path (str): The file path to the npz star database.
     ///     imu_type (str, optional): The specific IMU to use (e.g. "bno085", "bmi160", "auto", "none"). Defaults to auto-detection.
-    pub fn new(database_path: &str, imu_type: Option<&str>) -> PyResult<Self> {
+    ///     enable_accel (bool, optional): Whether to enable accelerometer hardware/features. Defaults to true.
+    pub fn new(database_path: &str, imu_type: Option<&str>, enable_accel: bool) -> PyResult<Self> {
         let rust_imu_type = match imu_type {
             Some(s) => Some(
                 s.parse::<crate::ImuType>()
@@ -31,8 +32,13 @@ impl PyFusedSolver {
             None => None,
         };
 
-        let inner = FusedSolver::new(std::path::Path::new(database_path), rust_imu_type, None)
-            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let inner = FusedSolver::new(
+            std::path::Path::new(database_path),
+            rust_imu_type,
+            None,
+            enable_accel,
+        )
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         Ok(Self { inner })
     }
 

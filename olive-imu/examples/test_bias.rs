@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut imu_engine = None;
 
     // Try BNO085 at 0x4B on bus 3
-    if let Ok(device) = Bno085Device::new(10, 0x4B, use_calibrated, Some(3)) {
+    if let Ok(device) = Bno085Device::new(10, 0x4B, use_calibrated, Some(3), true) {
         if let Ok(engine) = Imu::start(device, None) {
             println!("BNO085 successfully initialized at 0x4B!");
             imu_engine = Some(engine);
@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Try BNO085 at 0x4A on bus 3
     if imu_engine.is_none() {
-        if let Ok(device) = Bno085Device::new(10, 0x4A, use_calibrated, Some(3)) {
+        if let Ok(device) = Bno085Device::new(10, 0x4A, use_calibrated, Some(3), true) {
             if let Ok(engine) = Imu::start(device, None) {
                 println!("BNO085 successfully initialized at 0x4A!");
                 imu_engine = Some(engine);
@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Try BNO085 at 0x4B
-    if let Ok(device) = Bno085Device::new(10, 0x4B, use_calibrated, None) {
+    if let Ok(device) = Bno085Device::new(10, 0x4B, use_calibrated, None, true) {
         if let Ok(engine) = Imu::start(device, None) {
             println!("BNO085 successfully initialized at 0x4B!");
             imu_engine = Some(engine);
@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Try BNO085 at 0x4A
     if imu_engine.is_none() {
-        if let Ok(device) = Bno085Device::new(10, 0x4A, use_calibrated, None) {
+        if let Ok(device) = Bno085Device::new(10, 0x4A, use_calibrated, None, true) {
             if let Ok(engine) = Imu::start(device, None) {
                 println!("BNO085 successfully initialized at 0x4A!");
                 imu_engine = Some(engine);
@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Try BNO055 at 0x28
     if imu_engine.is_none() {
-        if let Ok(device) = Bno055Device::new(10, 0x28) {
+        if let Ok(device) = Bno055Device::new(10, 0x28, true) {
             if let Ok(engine) = Imu::start(device, None) {
                 println!("BNO055 successfully initialized at 0x28!");
                 imu_engine = Some(engine);
@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Try BNO055 at 0x29
     if imu_engine.is_none() {
-        if let Ok(device) = Bno055Device::new(10, 0x29) {
+        if let Ok(device) = Bno055Device::new(10, 0x29, true) {
             if let Ok(engine) = Imu::start(device, None) {
                 println!("BNO055 successfully initialized at 0x29!");
                 imu_engine = Some(engine);
@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Try BMI160 at 0x68
     if imu_engine.is_none() {
-        if let Ok(device) = Bmi160Device::new(0x68) {
+        if let Ok(device) = Bmi160Device::new(0x68, true) {
             if let Ok(engine) = Imu::start(device, None) {
                 println!("BMI160 successfully initialized at 0x68!");
                 imu_engine = Some(engine);
@@ -100,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Try BMI160 at 0x69
     if imu_engine.is_none() {
-        if let Ok(device) = Bmi160Device::new(0x69) {
+        if let Ok(device) = Bmi160Device::new(0x69, true) {
             if let Ok(engine) = Imu::start(device, None) {
                 println!("BMI160 successfully initialized at 0x69!");
                 imu_engine = Some(engine);
@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Try MPUXXXX at 0x68
     if imu_engine.is_none() {
-        if let Ok(device) = MpuXxxxDevice::new(10, 0x68) {
+        if let Ok(device) = MpuXxxxDevice::new(10, 0x68, true) {
             if let Ok(engine) = Imu::start(device, None) {
                 println!("MPUXXXX successfully initialized at 0x68!");
                 imu_engine = Some(engine);
@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Try MPUXXXX at 0x69
     if imu_engine.is_none() {
-        if let Ok(device) = MpuXxxxDevice::new(10, 0x69) {
+        if let Ok(device) = MpuXxxxDevice::new(10, 0x69, true) {
             if let Ok(engine) = Imu::start(device, None) {
                 println!("MPUXXXX successfully initialized at 0x69!");
                 imu_engine = Some(engine);

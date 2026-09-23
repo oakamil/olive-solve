@@ -181,8 +181,8 @@ pub fn parse_bmi160_fifo(
 mod hardware {
     use super::parse_bmi160_fifo;
     use bmi160::{
-        AccelerometerPowerMode, AccelerometerRange, Bmi160, GyroscopePowerMode, GyroscopeRange,
-        SlaveAddr, interface::I2cInterface,
+        AccelerometerPowerMode, AccelerometerRange, Bmi160, GyroscopeBwp, GyroscopeOdr,
+        GyroscopePowerMode, GyroscopeRange, SlaveAddr, interface::I2cInterface,
     };
     use linux_embedded_hal::I2cdev;
     use log::{info, warn};
@@ -192,10 +192,11 @@ mod hardware {
     pub struct Bmi160Device {
         imu: Bmi160<I2cInterface<I2cdev>>,
         last_sensor_time: Option<u32>,
+        enable_accel: bool,
     }
 
     impl Bmi160Device {
-        pub fn new(address_u8: u8) -> Result<Self, String> {
+        pub fn new(address_u8: u8, enable_accel: bool) -> Result<Self, String> {
             info!(
                 "Initializing BMI160 hardware over I2C at address 0x{:X}...",
                 address_u8
@@ -231,6 +232,7 @@ mod hardware {
             Ok(Self {
                 imu,
                 last_sensor_time: None,
+                enable_accel,
             })
         }
     }
@@ -241,6 +243,11 @@ mod hardware {
             self.imu
                 .set_gyro_range(GyroscopeRange::Scale2000)
                 .map_err(|_| "Failed to set BMI160 gyro range".to_string())?;
+
+            // Configure hardware DLPF for maximum smoothing (100Hz ODR, OSR4)
+            self.imu
+                .set_gyro_conf(GyroscopeOdr::Hz100, GyroscopeBwp::Osr4)
+                .map_err(|_| "Failed to configure BMI160 gyro filtering".to_string())?;
 
             self.imu
                 .set_accel_range(AccelerometerRange::G2)
@@ -254,13 +261,15 @@ mod hardware {
             // BMI160 needs ~100ms for gyro to fully turn on from suspend
             std::thread::sleep(std::time::Duration::from_millis(100));
 
-            // Turn on the accel
-            self.imu
-                .set_accel_power_mode(AccelerometerPowerMode::Normal)
-                .map_err(|_| "Failed to enable BMI160 accel".to_string())?;
+            if self.enable_accel {
+                // Turn on the accel
+                self.imu
+                    .set_accel_power_mode(AccelerometerPowerMode::Normal)
+                    .map_err(|_| "Failed to enable BMI160 accel".to_string())?;
 
-            // Accel needs at least 10ms to transition
-            std::thread::sleep(std::time::Duration::from_millis(10));
+                // Accel needs at least 10ms to transition
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
 
             // Configure FIFO for Header mode + Gyro + Time
             self.imu
@@ -302,11 +311,13 @@ mod hardware {
 
             std::thread::sleep(std::time::Duration::from_millis(100));
 
-            self.imu
-                .set_accel_power_mode(AccelerometerPowerMode::Normal)
-                .map_err(|_| "Failed to revive BMI160 accel".to_string())?;
+            if self.enable_accel {
+                self.imu
+                    .set_accel_power_mode(AccelerometerPowerMode::Normal)
+                    .map_err(|_| "Failed to revive BMI160 accel".to_string())?;
 
-            std::thread::sleep(std::time::Duration::from_millis(10));
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
 
             let _ = self.imu.config_fifo();
 
@@ -333,7 +344,7 @@ mod stub {
 
     impl Bmi160Device {
         /// Creates a new `Bmi160Device`.
-        pub fn new(_address: u8) -> Result<Self, String> {
+        pub fn new(_address: u8, _enable_accel: bool) -> Result<Self, String> {
             Err("Hardware I2C is only supported on Linux/Android".into())
         }
     }
