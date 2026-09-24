@@ -23,7 +23,7 @@ chrono = "0.4"
 log = "0.4"
 
 ndarray = "0.17.2"
-nalgebra = "0.32"
+nalgebra = "0.35.0"
 
 [workspace]
 members = [

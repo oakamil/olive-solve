@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use cedar_detect::algorithm::{estimate_noise_from_image, get_stars_from_image};
@@ -1163,7 +1163,7 @@ fn generate_python_test_fixtures() {
                     let file = File::create(&zip_path).unwrap();
                     let mut zip = ZipWriter::new(file);
                     let options =
-                        FileOptions::default().compression_method(CompressionMethod::Deflated);
+                        SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
                     zip.start_file("results.json", options).unwrap();
                     let json_bytes = serde_json::to_vec_pretty(&all_results).unwrap();
