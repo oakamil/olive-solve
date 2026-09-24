@@ -369,6 +369,97 @@ impl PyFusedSolver {
         }
     }
 
+    #[pyo3(signature = (ra_or_dict, dec=None, roll=None, timestamp=None, pointing_only=false))]
+    /// Feeds an external high-confidence plate solve into the fused solver.
+    ///
+    /// Updates the latest solved celestial position, clears the solve failure flag,
+    /// and anchors the IMU if running and observer coordinates are configured.
+    ///
+    /// Can be invoked with explicit coordinates:
+    ///     update_position(ra, dec, roll=0.0, timestamp=None, pointing_only=False)
+    /// or with a solution dictionary (matching the format returned by `solve_from_*`):
+    ///     update_position(solution_dict, timestamp=None, pointing_only=False)
+    ///
+    /// Args:
+    ///     ra_or_dict (float or dict): Celestial Right Ascension in degrees (J2000), or a dictionary
+    ///         containing 'ra', 'dec', and optional 'roll' keys.
+    ///     dec (float, optional): Celestial Declination in degrees (J2000). Required if ra_or_dict is a float.
+    ///     roll (float, optional): Camera position angle / roll in degrees. Defaults to 0.0.
+    ///     timestamp (float, optional): Observation time as Unix timestamp in seconds. Defaults to current system time.
+    ///     pointing_only (bool, optional): If False (default), the slew delta contributes to IMU SVD calibration.
+    ///         If True, updates only the pointing anchor (useful for synthetic testing or drift reset). Defaults to False.
+    ///
+    /// Returns:
+    ///     bool: True if the IMU tracking anchor was successfully updated, or False if only the internal position was updated.
+    ///
+    /// Raises:
+    ///     TypeError: If arguments are of incorrect types or required coordinate keys are missing.
+    ///     ValueError: If coordinate values cannot be parsed or are invalid.
+    pub fn update_position<'py>(
+        &self,
+        _py: Python<'py>,
+        ra_or_dict: Bound<'py, PyAny>,
+        dec: Option<f64>,
+        roll: Option<f64>,
+        timestamp: Option<f64>,
+        pointing_only: bool,
+    ) -> PyResult<bool> {
+        let (final_ra, final_dec, final_roll, dict_ts) =
+            if let Ok(dict) = ra_or_dict.cast::<PyDict>() {
+                let ra: f64 = dict
+                    .get_item("ra")?
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err("Dictionary must contain 'ra' key")
+                    })?
+                    .extract()?;
+                let dec: f64 = dict
+                    .get_item("dec")?
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err("Dictionary must contain 'dec' key")
+                    })?
+                    .extract()?;
+                let r: f64 = if let Some(r_val) = dict.get_item("roll")? {
+                    r_val.extract().unwrap_or(0.0)
+                } else {
+                    roll.unwrap_or(0.0)
+                };
+                let ts: Option<f64> = if let Some(ts_val) = dict.get_item("timestamp")? {
+                    ts_val.extract().ok()
+                } else {
+                    None
+                };
+                (ra, dec, r, ts)
+            } else if let Ok(ra_num) = ra_or_dict.extract::<f64>() {
+                let dec_num = dec.ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "'dec' must be provided when passing 'ra' as a number",
+                    )
+                })?;
+                (ra_num, dec_num, roll.unwrap_or(0.0), None)
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "First argument must be a dictionary or a numeric 'ra' coordinate",
+                ));
+            };
+
+        let effective_ts = timestamp.or(dict_ts);
+        let rust_timestamp = effective_ts.map(|ts| {
+            if ts >= 0.0 {
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(ts)
+            } else {
+                std::time::SystemTime::now()
+            }
+        });
+
+        Ok(self.inner.update_position(
+            final_ra,
+            final_dec,
+            Some(final_roll),
+            rust_timestamp,
+            pointing_only,
+        ))
+    }
+
     /// Fetches the latest real-time hardware telemetry from the IMU.
     ///
     /// Returns:

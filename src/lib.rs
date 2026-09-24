@@ -805,6 +805,70 @@ impl FusedSolver {
         });
     }
 
+    /// Feeds an external high-confidence plate solve into the fused solver.
+    ///
+    /// Updates the device's celestial orientation anchor, clears the internal solve failure flag,
+    /// and anchors the hardware IMU if running and observer coordinates are configured.
+    ///
+    /// # Arguments
+    ///
+    /// * `ra` - Celestial Right Ascension in degrees (J2000 equinox).
+    /// * `dec` - Celestial Declination in degrees (J2000 equinox).
+    /// * `roll` - Optional celestial roll / camera position angle in degrees. Defaults to `0.0`.
+    /// * `timestamp` - The point in time when this celestial orientation was observed. If `None`, defaults to `SystemTime::now()`.
+    /// * `pointing_only` - If `false` (default for real plate solves), feeds the camera motion delta into the IMU's SVD calibration engine.
+    ///                     If `true` (useful for testing or simulation), updates only the pointing orientation to reset gyro drift without altering calibration.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if the IMU tracking anchor was successfully updated, or `false` if only the fallback solver position was updated (e.g. when IMU is inactive or observer location is not set).
+    pub fn update_position(
+        &self,
+        ra: f64,
+        dec: f64,
+        roll: Option<f64>,
+        timestamp: Option<SystemTime>,
+        pointing_only: bool,
+    ) -> bool {
+        let dummy_solution = Solution {
+            ra: Some(ra),
+            dec: Some(dec),
+            roll: Some(roll.unwrap_or(0.0)),
+            status: SolveStatus::MatchFound,
+            ..Default::default()
+        };
+
+        self.update_from_solution(&dummy_solution, timestamp, pointing_only)
+    }
+
+    /// Feeds a full [`Solution`] into the fused solver as a high-confidence match.
+    ///
+    /// Updates the device's celestial orientation anchor, clears the internal solve failure flag,
+    /// and anchors the hardware IMU if running and observer coordinates are configured.
+    ///
+    /// # Arguments
+    ///
+    /// * `solution` - The [`Solution`] instance containing solved celestial coordinates (`ra`, `dec`, and optional `roll`).
+    /// * `timestamp` - The point in time when this solution was valid. If `None`, defaults to `SystemTime::now()`.
+    /// * `pointing_only` - If `true`, bypasses SVD calibration and updates pointing only.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if the IMU tracking anchor was successfully updated, or `false` if only the fallback solver position was updated.
+    pub fn update_from_solution(
+        &self,
+        solution: &Solution,
+        timestamp: Option<SystemTime>,
+        pointing_only: bool,
+    ) -> bool {
+        let time = timestamp.unwrap_or_else(SystemTime::now);
+        *self.last_solve_failed.write().unwrap() = false;
+        self.update_anchor_internal(solution, time, pointing_only);
+        self.imu.read().unwrap().is_some()
+            && self.latitude.read().unwrap().is_some()
+            && self.longitude.read().unwrap().is_some()
+    }
+
     fn update_anchor_from_solution(&self, solution: &Solution, time: SystemTime) {
         self.update_anchor_internal(solution, time, false);
     }
@@ -1675,5 +1739,72 @@ mod new_tests {
             "Candidate should be rejected as it is >{} degrees away",
             LOW_CONFIDENCE_MATCH_DEVIATION_TOLERANCE_DEG
         );
+    }
+
+    #[test]
+    fn test_update_position_without_imu() {
+        let fs = FusedSolver {
+            solver: Arc::new(RwLock::new(None)),
+            extractor: Arc::new(RwLock::new(None)),
+            fast_extractor: Arc::new(RwLock::new(None)),
+            imu: Arc::new(RwLock::new(None)),
+            imu_type: Arc::new(RwLock::new(ImuType::None)),
+            storage: None,
+            latest_solve_position: Arc::new(RwLock::new(None)),
+            last_solve_failed: Arc::new(RwLock::new(true)), // Simulate previous failure
+            enable_accel: true,
+            latitude: Arc::new(RwLock::new(None)),
+            longitude: Arc::new(RwLock::new(None)),
+        };
+
+        let imu_anchored = fs.update_position(123.4, 56.7, Some(8.9), None, false);
+        assert!(!imu_anchored, "IMU should not be anchored when inactive");
+
+        // Verify last_solve_failed was reset
+        assert!(!*fs.last_solve_failed.read().unwrap());
+
+        // Verify latest position
+        let pos = fs
+            .get_latest_position()
+            .expect("Position should be available");
+        assert_eq!(pos.ra, 123.4);
+        assert_eq!(pos.dec, 56.7);
+        assert_eq!(pos.roll, 8.9);
+        assert_eq!(pos.source, PositionSource::Solver);
+    }
+
+    #[test]
+    fn test_update_from_solution() {
+        let fs = FusedSolver {
+            solver: Arc::new(RwLock::new(None)),
+            extractor: Arc::new(RwLock::new(None)),
+            fast_extractor: Arc::new(RwLock::new(None)),
+            imu: Arc::new(RwLock::new(None)),
+            imu_type: Arc::new(RwLock::new(ImuType::None)),
+            storage: None,
+            latest_solve_position: Arc::new(RwLock::new(None)),
+            last_solve_failed: Arc::new(RwLock::new(true)),
+            enable_accel: true,
+            latitude: Arc::new(RwLock::new(None)),
+            longitude: Arc::new(RwLock::new(None)),
+        };
+
+        let sol = tetra3::solver::Solution {
+            ra: Some(200.5),
+            dec: Some(-15.2),
+            roll: Some(45.0),
+            status: tetra3::solver::SolveStatus::MatchFound,
+            ..Default::default()
+        };
+
+        let imu_anchored = fs.update_from_solution(&sol, None, false);
+        assert!(!imu_anchored);
+        assert!(!*fs.last_solve_failed.read().unwrap());
+
+        let pos = fs.get_latest_position().unwrap();
+        assert_eq!(pos.ra, 200.5);
+        assert_eq!(pos.dec, -15.2);
+        assert_eq!(pos.roll, 45.0);
+        assert_eq!(pos.source, PositionSource::Solver);
     }
 }
