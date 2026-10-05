@@ -94,6 +94,8 @@ pub struct Position {
     pub dec: f64,
     /// Roll in degrees.
     pub roll: f64,
+    /// True if the field was solved under mirrored (horizontally flipped) optical parity.
+    pub is_mirrored: bool,
     /// The source that provided this position estimate.
     pub source: PositionSource,
     /// The time at which this position was valid.
@@ -800,6 +802,7 @@ impl FusedSolver {
             ra,
             dec,
             roll,
+            is_mirrored: solution.is_mirrored,
             source: PositionSource::Solver,
             timestamp: time,
         });
@@ -992,10 +995,12 @@ impl FusedSolver {
                         PositionSource::SolverStale
                     };
 
+                    let is_mirrored = last_solve.as_ref().map(|p| p.is_mirrored).unwrap_or(false);
                     return Some(Position {
                         ra: current_ra,
                         dec: current_dec,
                         roll: current_roll,
+                        is_mirrored,
                         source,
                         timestamp: SystemTime::now(),
                     });
@@ -1273,6 +1278,7 @@ mod tests {
                 ra: 10.0,
                 dec: 20.0,
                 roll: 0.0,
+                is_mirrored: false,
                 source: PositionSource::Solver,
                 timestamp: std::time::SystemTime::UNIX_EPOCH,
             }))),

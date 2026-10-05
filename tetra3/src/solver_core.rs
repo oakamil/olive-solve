@@ -938,7 +938,7 @@ fn verify_and_build_solution(
         let mut target_dec = Vec::new();
         for v in rotated_target_vector {
             target_ra.push(v[1].atan2(v[0]).to_degrees().rem_euclid(360.0));
-            target_dec.push(90.0 - v[2].acos().to_degrees());
+            target_dec.push(90.0 - v[2].clamp(-1.0, 1.0).acos().to_degrees());
         }
         solution.target_ra = Some(target_ra);
         solution.target_dec = Some(target_dec);
