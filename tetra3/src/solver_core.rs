@@ -1275,9 +1275,10 @@ impl Solver {
     /// Loads a cedar-solve database from the given path.
     pub fn load_database(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let file = File::open(path)?;
-        let mut archive = ZipArchive::new(file)?;
+        let buffered = std::io::BufReader::new(file);
+        let mut archive = ZipArchive::new(buffered)?;
 
-        let read_star_table = |arc: &mut ZipArchive<File>,
+        let read_star_table = |arc: &mut ZipArchive<std::io::BufReader<File>>,
                                name: &str|
          -> Result<Vec<f64>, Box<dyn std::error::Error>> {
             let mut zf = arc.by_name(name)?;
@@ -1306,7 +1307,7 @@ impl Solver {
 
         // tetra3.py optimizes the data type of the pattern_catalog based on the number of patterns.
         let read_pattern_catalog =
-            |arc: &mut ZipArchive<File>,
+            |arc: &mut ZipArchive<std::io::BufReader<File>>,
              name: &str|
              -> Result<(PatternCatalog, usize), Box<dyn std::error::Error>> {
                 let mut zf = arc.by_name(name)?;
@@ -1344,40 +1345,42 @@ impl Solver {
                 Ok((PatternCatalog::U32(data_u32), nrows))
             };
 
-        let read_pattern_edge = |arc: &mut ZipArchive<File>, name: &str| -> Option<PatternEdge> {
-            arc.by_name(name).ok().and_then(|mut zf| {
-                let mut buf = Vec::new();
-                zf.read_to_end(&mut buf).ok()?;
+        let read_pattern_edge =
+            |arc: &mut ZipArchive<std::io::BufReader<File>>, name: &str| -> Option<PatternEdge> {
+                arc.by_name(name).ok().and_then(|mut zf| {
+                    let mut buf = Vec::new();
+                    zf.read_to_end(&mut buf).ok()?;
 
-                let mut cursor = Cursor::new(&buf);
-                if let Ok(npy) = NpyFile::new(&mut cursor) {
-                    if let Ok(vec_f16) = npy.into_vec::<half::f16>() {
-                        return Some(PatternEdge::F16(vec_f16));
+                    let mut cursor = Cursor::new(&buf);
+                    if let Ok(npy) = NpyFile::new(&mut cursor) {
+                        if let Ok(vec_f16) = npy.into_vec::<half::f16>() {
+                            return Some(PatternEdge::F16(vec_f16));
+                        }
                     }
-                }
 
-                let mut cursor = Cursor::new(&buf);
-                if let Ok(npy) = NpyFile::new(&mut cursor) {
-                    if let Ok(vec_f32) = npy.into_vec::<f32>() {
-                        return Some(PatternEdge::F32(vec_f32));
+                    let mut cursor = Cursor::new(&buf);
+                    if let Ok(npy) = NpyFile::new(&mut cursor) {
+                        if let Ok(vec_f32) = npy.into_vec::<f32>() {
+                            return Some(PatternEdge::F32(vec_f32));
+                        }
                     }
-                }
-                None
-            })
-        };
+                    None
+                })
+            };
 
-        let read_1d_u16 = |arc: &mut ZipArchive<File>, name: &str| -> Option<Vec<u16>> {
-            arc.by_name(name).ok().and_then(|mut zf| {
-                let mut buf = Vec::new();
-                zf.read_to_end(&mut buf).ok()?;
-                let mut cursor = Cursor::new(&buf);
-                let npy = NpyFile::new(&mut cursor).ok()?;
-                npy.into_vec().ok()
-            })
-        };
+        let read_1d_u16 =
+            |arc: &mut ZipArchive<std::io::BufReader<File>>, name: &str| -> Option<Vec<u16>> {
+                arc.by_name(name).ok().and_then(|mut zf| {
+                    let mut buf = Vec::new();
+                    zf.read_to_end(&mut buf).ok()?;
+                    let mut cursor = Cursor::new(&buf);
+                    let npy = NpyFile::new(&mut cursor).ok()?;
+                    npy.into_vec().ok()
+                })
+            };
 
         let read_star_catalog_ids =
-            |arc: &mut ZipArchive<File>, name: &str| -> Option<Array2<u32>> {
+            |arc: &mut ZipArchive<std::io::BufReader<File>>, name: &str| -> Option<Array2<u32>> {
                 arc.by_name(name).ok().and_then(|mut zf| {
                     let mut buf = Vec::new();
                     zf.read_to_end(&mut buf).ok()?;
