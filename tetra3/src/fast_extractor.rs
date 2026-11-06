@@ -180,10 +180,8 @@ pub struct FastExtractor {
     // -------------------------------------------------------------------------
     // Primary Buffers
     // -------------------------------------------------------------------------
-    /// Stores the contiguous raw `u8` input if the provided view is strided.
+    /// Stores the contiguous raw `u8` input if the provided view is strided or cropped.
     contiguous_u8: Vec<u8>,
-    /// Stores the pooled sum of downsampled `u8` pixels. Uses `u32` to prevent overflow.
-    downsampled_u32: Vec<u32>,
 
     // -------------------------------------------------------------------------
     // Fixed-Point Mathematical Pipelines
@@ -194,7 +192,8 @@ pub struct FastExtractor {
     // by 128.0 before storing them as integers, giving us 7 bits of subpixel precision.
     /// Used for 1x resolution. Background-subtracted intensities stored as scaled `i16`.
     image_i16: Vec<i16>,
-    /// Used for downsampled data. `i32` used here because downsampled sums can exceed `i16` bounds.
+    /// Used for downsampled data. Stores pooled `u8` sums initially, then in-place
+    /// background-subtracted scaled `i32` intensities.
     image_i32: Vec<i32>,
 
     // -------------------------------------------------------------------------
@@ -207,10 +206,10 @@ pub struct FastExtractor {
     // Look-Up Tables (LUTs) for BlockMedian
     // -------------------------------------------------------------------------
     bg_grid: Vec<f32>,
-    bg_gx0: Vec<usize>,
+    bg_gx0: Vec<u32>,
     bg_tx: Vec<f32>,
-    bg_gy0: Vec<usize>,
-    bg_gy1: Vec<usize>,
+    bg_gy0: Vec<u32>,
+    bg_gy1: Vec<u32>,
     bg_ty: Vec<f32>,
 
     // Pre-calculated weights for Centroid Window calculation
@@ -220,10 +219,10 @@ pub struct FastExtractor {
 
     // Morphological & Centroiding buffers
     block_hists: Vec<u32>,
-    candidate_pixels: Vec<usize>,
-    eroded_pixels: Vec<usize>,
-    mask: Vec<bool>,
-    stack: Vec<usize>,
+    candidate_pixels: Vec<u32>,
+    eroded_pixels: Vec<u32>,
+    mask: Vec<u64>,
+    stack: Vec<u32>,
 }
 
 impl FastExtractor {
@@ -280,11 +279,11 @@ impl FastExtractor {
 
         let mut bg_grid = Vec::new();
         let mut block_hists = Vec::new();
-        let mut bg_gx0 = vec![0; out_width];
-        let mut bg_tx = vec![0.0; out_width];
-        let mut bg_gy0 = vec![0; out_height];
-        let mut bg_gy1 = vec![0; out_height];
-        let mut bg_ty = vec![0.0; out_height];
+        let mut bg_gx0 = Vec::new();
+        let mut bg_tx = Vec::new();
+        let mut bg_gy0 = Vec::new();
+        let mut bg_gy1 = Vec::new();
+        let mut bg_ty = Vec::new();
 
         // Pre-compute bilinear interpolation weights and indices (LUTs) to remove math from hot loops
         if let Some(FastBgSubMode::BlockMedian { block_size }) = options.bg_sub_mode {
@@ -297,10 +296,15 @@ impl FastExtractor {
                 _ => 4096,
             };
             block_hists.resize(grid_w * hist_bins, 0);
+            bg_gx0.resize(out_width, 0);
+            bg_tx.resize(out_width, 0.0);
+            bg_gy0.resize(out_height, 0);
+            bg_gy1.resize(out_height, 0);
+            bg_ty.resize(out_height, 0.0);
 
             for x in 0..out_width {
                 let cx = (x as f32 / block_size as f32) - 0.5;
-                let gx0 = cx.floor().clamp(0.0, grid_w.saturating_sub(1) as f32) as usize;
+                let gx0 = cx.floor().clamp(0.0, grid_w.saturating_sub(1) as f32) as u32;
                 bg_gx0[x] = gx0;
                 bg_tx[x] = cx - cx.floor();
             }
@@ -309,8 +313,8 @@ impl FastExtractor {
                 let cy = (y as f32 / block_size as f32) - 0.5;
                 let gy0 = cy.floor().clamp(0.0, grid_h.saturating_sub(1) as f32) as usize;
                 // Pre-multiply by stride to eliminate per-row multiplications in the hot loop
-                bg_gy0[y] = gy0 * grid_w;
-                bg_gy1[y] = (gy0 + 1).min(grid_h.saturating_sub(1)) * grid_w;
+                bg_gy0[y] = (gy0 * grid_w) as u32;
+                bg_gy1[y] = ((gy0 + 1).min(grid_h.saturating_sub(1)) * grid_w) as u32;
                 bg_ty[y] = cy - cy.floor();
             }
         }
@@ -332,6 +336,10 @@ impl FastExtractor {
             }
         }
 
+        let is_downsampled = ds > 1;
+        let needs_median_scratch = options.sigma_mode == FastSigmaMode::GlobalMedianAbs;
+        let needs_crop_buf = options.crop.is_some();
+
         Self {
             orig_width,
             orig_height,
@@ -340,13 +348,32 @@ impl FastExtractor {
             out_width,
             out_height,
             options,
-            contiguous_u8: vec![0; total_pixels],
-            downsampled_u32: vec![0; out_pixels],
-            image_i16: vec![0; total_pixels],
-            image_i32: vec![0; out_pixels],
-            // Pre-allocate exact capacities for median filtering
-            median_scratch_i16: Vec::with_capacity(total_pixels),
-            median_scratch_i32: Vec::with_capacity(out_pixels),
+            contiguous_u8: if needs_crop_buf {
+                vec![0; total_pixels]
+            } else {
+                Vec::new()
+            },
+            image_i16: if !is_downsampled {
+                vec![0; total_pixels]
+            } else {
+                Vec::new()
+            },
+            image_i32: if is_downsampled {
+                vec![0; out_pixels]
+            } else {
+                Vec::new()
+            },
+            // Pre-allocate exact capacities for median filtering only when GlobalMedianAbs is enabled
+            median_scratch_i16: if !is_downsampled && needs_median_scratch {
+                Vec::with_capacity(total_pixels)
+            } else {
+                Vec::new()
+            },
+            median_scratch_i32: if is_downsampled && needs_median_scratch {
+                Vec::with_capacity(out_pixels)
+            } else {
+                Vec::new()
+            },
             bg_grid,
             bg_gx0,
             bg_tx,
@@ -359,7 +386,7 @@ impl FastExtractor {
             block_hists,
             candidate_pixels: Vec::with_capacity(2048),
             eroded_pixels: Vec::with_capacity(512),
-            mask: vec![false; out_pixels],
+            mask: vec![0u64; out_pixels.div_ceil(64)],
             stack: Vec::with_capacity(1024),
         }
     }
@@ -400,6 +427,10 @@ impl FastExtractor {
             let src_slice = input_image.as_slice().unwrap();
             self.extract_core(src_slice, variants)
         } else {
+            let needed = self.width * self.height;
+            if self.contiguous_u8.len() < needed {
+                self.contiguous_u8.resize(needed, 0);
+            }
             let cropped_view = input_image.slice(ndarray::s![
                 crop_y..crop_y + self.height,
                 crop_x..crop_x + self.width
@@ -458,6 +489,11 @@ impl FastExtractor {
         } else {
             (0, 0)
         };
+
+        let needed = self.width * self.height;
+        if self.contiguous_u8.len() < needed {
+            self.contiguous_u8.resize(needed, 0);
+        }
 
         let cropped_view = input_image.slice(ndarray::s![
             crop_y..crop_y + self.height,
@@ -556,12 +592,12 @@ impl FastExtractor {
 
         let base_noise = if ds > 1 {
             // =====================================================================================
-            // DOWNSAMPLED PATH (Uses `u32` for accumulation, `i32` for processing)
+            // DOWNSAMPLED PATH (Uses `i32` in-place for accumulation and processing)
             // =====================================================================================
 
             // SIMD-friendly unrolled downsampling loops.
             if ds == 2 {
-                self.downsampled_u32
+                self.image_i32
                     .chunks_exact_mut(self.out_width)
                     .enumerate()
                     .for_each(|(out_y, row)| {
@@ -571,30 +607,30 @@ impl FastExtractor {
                             unsafe {
                                 let r1 = start_y * self.width + start_x;
                                 let r2 = (start_y + 1) * self.width + start_x;
-                                let sum = *src_slice.get_unchecked(r1) as u32
-                                    + *src_slice.get_unchecked(r1 + 1) as u32
-                                    + *src_slice.get_unchecked(r2) as u32
-                                    + *src_slice.get_unchecked(r2 + 1) as u32;
+                                let sum = *src_slice.get_unchecked(r1) as i32
+                                    + *src_slice.get_unchecked(r1 + 1) as i32
+                                    + *src_slice.get_unchecked(r2) as i32
+                                    + *src_slice.get_unchecked(r2 + 1) as i32;
                                 *row.get_unchecked_mut(out_x) = sum;
                             }
                         }
                     });
             } else if ds == 4 {
-                self.downsampled_u32
+                self.image_i32
                     .chunks_exact_mut(self.out_width)
                     .enumerate()
                     .for_each(|(out_y, row)| {
                         let start_y = out_y * 4;
                         for out_x in 0..self.out_width {
                             let start_x = out_x * 4;
-                            let mut sum = 0u32;
+                            let mut sum = 0i32;
                             unsafe {
                                 for dy in 0..4 {
                                     let r = (start_y + dy) * self.width + start_x;
-                                    sum += *src_slice.get_unchecked(r) as u32
-                                        + *src_slice.get_unchecked(r + 1) as u32
-                                        + *src_slice.get_unchecked(r + 2) as u32
-                                        + *src_slice.get_unchecked(r + 3) as u32;
+                                    sum += *src_slice.get_unchecked(r) as i32
+                                        + *src_slice.get_unchecked(r + 1) as i32
+                                        + *src_slice.get_unchecked(r + 2) as i32
+                                        + *src_slice.get_unchecked(r + 3) as i32;
                                 }
                                 *row.get_unchecked_mut(out_x) = sum;
                             }
@@ -608,20 +644,20 @@ impl FastExtractor {
                         // OPTIMIZATION: Calculate sum and sum-of-squares in one pass.
                         let mut sum = 0u64;
                         let mut sum_sq = 0u64;
-                        for &v in &self.downsampled_u32 {
+                        for &v in &self.image_i32 {
                             let v64 = v as u64;
                             sum += v64;
                             sum_sq += v64 * v64;
                         }
-                        let n = self.downsampled_u32.len() as f64;
+                        let n = self.image_i32.len() as f64;
                         let mean = sum as f64 / n;
                         let total_sum_sq =
                             (sum_sq as f64) - 2.0 * mean * (sum as f64) + n * mean * mean;
 
-                        // OPTIMIZATION: Pure integer hot loop for subtraction and scaling.
+                        // OPTIMIZATION: Pure integer hot loop for in-place subtraction and scaling.
                         let scaled_mean = (mean * 128.0).round() as i32;
-                        for (o, &i) in self.image_i32.iter_mut().zip(self.downsampled_u32.iter()) {
-                            *o = (i as i32 * 128) - scaled_mean;
+                        for o in self.image_i32.iter_mut() {
+                            *o = (*o * 128) - scaled_mean;
                         }
                         total_sum_sq
                     }
@@ -636,11 +672,7 @@ impl FastExtractor {
                         } else {
                             1
                         };
-                        for row in self
-                            .downsampled_u32
-                            .chunks_exact(self.out_width)
-                            .step_by(step)
-                        {
+                        for row in self.image_i32.chunks_exact(self.out_width).step_by(step) {
                             for &v in row {
                                 unsafe {
                                     *hist.get_unchecked_mut(v as usize) += 1;
@@ -665,15 +697,15 @@ impl FastExtractor {
                         let mut sum_i = 0u64;
                         let mut sum_sq_i = 0u64;
 
-                        for (o, &i) in self.image_i32.iter_mut().zip(self.downsampled_u32.iter()) {
-                            let iv = i as u64;
+                        for o in self.image_i32.iter_mut() {
+                            let iv = *o as u64;
                             sum_i += iv;
                             sum_sq_i += iv * iv;
-                            *o = (i as i32 * 128) - med_i32;
+                            *o = (*o * 128) - med_i32;
                         }
 
                         let med_f64 = med as f64;
-                        let n_f64 = self.downsampled_u32.len() as f64;
+                        let n_f64 = self.image_i32.len() as f64;
 
                         (sum_sq_i as f64) - 2.0 * med_f64 * (sum_i as f64)
                             + n_f64 * med_f64 * med_f64
@@ -683,17 +715,15 @@ impl FastExtractor {
                         let mut hist_buf = [0u32; 4096];
                         let hist = &mut hist_buf[..hist_bins];
                         let mut total_sum_sq = 0.0;
-                        let o_rows = self.image_i32.chunks_exact_mut(self.out_width);
-                        let i_rows = self.downsampled_u32.chunks_exact(self.out_width);
 
-                        for (o_row, i_row) in o_rows.zip(i_rows) {
+                        for row in self.image_i32.chunks_exact_mut(self.out_width) {
                             hist.fill(0);
                             let mut count = 0;
 
                             // OPTIMIZATION: Cache-line aligned interleaved sampling.
                             // Reads 64 contiguous pixels, then skips 64. This halves memory
                             // bandwidth while keeping hardware prefetchers perfectly fed.
-                            let mut chunks = i_row.chunks_exact(128);
+                            let mut chunks = row.chunks_exact(128);
                             for chunk in chunks.by_ref() {
                                 for &v in &chunk[0..64] {
                                     unsafe {
@@ -732,12 +762,12 @@ impl FastExtractor {
                             let mut sum_i = 0u64;
                             let mut sum_sq_i = 0u64;
 
-                            // Standard zip loop vectorizes natively via LLVM
-                            for (o, &i) in o_row.iter_mut().zip(i_row.iter()) {
-                                let iv = i as u64;
+                            // Standard in-place loop vectorizes natively via LLVM
+                            for o in row.iter_mut() {
+                                let iv = *o as u64;
                                 sum_i += iv;
                                 sum_sq_i += iv * iv;
-                                *o = (i as i32 - med_i32) * 128;
+                                *o = (*o - med_i32) * 128;
                             }
 
                             // Calculate mathematically equivalent variance exactly once per row
@@ -767,8 +797,7 @@ impl FastExtractor {
                             };
                             for y in (start_y..end_y).step_by(step) {
                                 let row_start = y * self.out_width;
-                                let row =
-                                    &self.downsampled_u32[row_start..row_start + self.out_width];
+                                let row = &self.image_i32[row_start..row_start + self.out_width];
                                 for gx in 0..grid_w {
                                     let start_x = gx * block_size;
                                     let end_x = (start_x + block_size).min(self.out_width);
@@ -814,12 +843,11 @@ impl FastExtractor {
 
                         self.image_i32
                             .chunks_exact_mut(self.out_width)
-                            .zip(self.downsampled_u32.chunks_exact(self.out_width))
                             .enumerate()
-                            .map(|(y, (out_row, src_row))| {
+                            .map(|(y, out_row)| {
                                 let mut row_sq_sum = 0.0;
-                                let row0_start = bg_gy0[y];
-                                let row1_start = bg_gy1[y];
+                                let row0_start = bg_gy0[y] as usize;
+                                let row1_start = bg_gy1[y] as usize;
                                 let ty = bg_ty[y];
                                 let row_v0 = &bg_grid[row0_start..row0_start + grid_w];
                                 let row_v1 = &bg_grid[row1_start..row1_start + grid_w];
@@ -840,7 +868,6 @@ impl FastExtractor {
                                 let mut sum_sq3_int = 0i64;
 
                                 let mut out_chunks = out_row.chunks_exact_mut(4);
-                                let mut src_chunks = src_row.chunks_exact(4);
                                 let mut gx0_chunks = bg_gx0.chunks_exact(4);
                                 let mut tx_chunks = bg_tx.chunks_exact(4);
 
@@ -850,23 +877,22 @@ impl FastExtractor {
                                 // Manually unrolled loop with multiple independent accumulators
                                 // improves instruction-level throughput.
                                 if self.options.approximate_background {
-                                    for (((o, s), gx), tx) in out_chunks
+                                    for ((o, gx), tx) in out_chunks
                                         .by_ref()
-                                        .zip(src_chunks.by_ref())
                                         .zip(gx0_chunks.by_ref())
                                         .zip(tx_chunks.by_ref())
                                     {
                                         unsafe {
-                                            let gx_val = *gx.get_unchecked(0);
+                                            let gx_val = *gx.get_unchecked(0) as usize;
                                             let tx_val = *tx.get_unchecked(0);
                                             let bg =
                                                 v_grid_row[gx_val] + tx_val * d_grid_row[gx_val];
                                             let bg_i32 = (bg * 128.0).round() as i32;
 
-                                            let val0 = (*s.get_unchecked(0) as i32 * 128) - bg_i32;
-                                            let val1 = (*s.get_unchecked(1) as i32 * 128) - bg_i32;
-                                            let val2 = (*s.get_unchecked(2) as i32 * 128) - bg_i32;
-                                            let val3 = (*s.get_unchecked(3) as i32 * 128) - bg_i32;
+                                            let val0 = (*o.get_unchecked(0) * 128) - bg_i32;
+                                            let val1 = (*o.get_unchecked(1) * 128) - bg_i32;
+                                            let val2 = (*o.get_unchecked(2) * 128) - bg_i32;
+                                            let val3 = (*o.get_unchecked(3) * 128) - bg_i32;
 
                                             *o.get_unchecked_mut(0) = val0;
                                             *o.get_unchecked_mut(1) = val1;
@@ -880,22 +906,20 @@ impl FastExtractor {
                                         }
                                     }
                                 } else {
-                                    for (((o, s), gx), tx) in out_chunks
+                                    for ((o, gx), tx) in out_chunks
                                         .by_ref()
-                                        .zip(src_chunks.by_ref())
                                         .zip(gx0_chunks.by_ref())
                                         .zip(tx_chunks.by_ref())
                                     {
                                         unsafe {
                                             for i in 0..4 {
-                                                let gx_val = *gx.get_unchecked(i);
+                                                let gx_val = *gx.get_unchecked(i) as usize;
                                                 let tx_val = *tx.get_unchecked(i);
                                                 let bg = v_grid_row[gx_val]
                                                     + tx_val * d_grid_row[gx_val];
                                                 let bg_i32 = (bg * 128.0).round() as i32;
 
-                                                let val =
-                                                    (*s.get_unchecked(i) as i32 * 128) - bg_i32;
+                                                let val = (*o.get_unchecked(i) * 128) - bg_i32;
                                                 *o.get_unchecked_mut(i) = val;
 
                                                 match i {
@@ -920,14 +944,13 @@ impl FastExtractor {
                                     let mut rem_sq_int = 0i64;
                                     for i in 0..x {
                                         unsafe {
-                                            let gx0 = *bg_gx0.get_unchecked(rem_x + i);
+                                            let gx0 = *bg_gx0.get_unchecked(rem_x + i) as usize;
                                             let tx = *bg_tx.get_unchecked(rem_x + i);
                                             let bg_val = v_grid_row[gx0] + tx * d_grid_row[gx0];
                                             let bg_i32 = (bg_val * 128.0).round() as i32;
 
-                                            let val = (*src_row.get_unchecked(rem_x + i) as i32
-                                                * 128)
-                                                - bg_i32;
+                                            let val =
+                                                (*out_row.get_unchecked(rem_x + i) * 128) - bg_i32;
                                             *out_row.get_unchecked_mut(rem_x + i) = val;
                                             rem_sq_int += val as i64 * val as i64;
                                         }
@@ -942,9 +965,8 @@ impl FastExtractor {
             } else {
                 self.image_i32
                     .iter_mut()
-                    .zip(self.downsampled_u32.iter())
-                    .map(|(o, &i)| {
-                        let val_f32 = i as f32;
+                    .map(|o| {
+                        let val_f32 = *o as f32;
                         *o = (val_f32 * 128.0).round() as i32;
                         (val_f32 * val_f32) as f64
                     })
@@ -1174,8 +1196,8 @@ impl FastExtractor {
                             .enumerate()
                             .map(|(y, (out_row, src_row))| {
                                 let mut row_sq_sum = 0.0;
-                                let row0_start = bg_gy0[y];
-                                let row1_start = bg_gy1[y];
+                                let row0_start = bg_gy0[y] as usize;
+                                let row1_start = bg_gy1[y] as usize;
                                 let ty = bg_ty[y];
                                 let row_v0 = &bg_grid[row0_start..row0_start + grid_w];
                                 let row_v1 = &bg_grid[row1_start..row1_start + grid_w];
@@ -1212,7 +1234,7 @@ impl FastExtractor {
                                     .zip(tx_chunks.by_ref())
                                 {
                                     unsafe {
-                                        let gx_val = *gx.get_unchecked(0);
+                                        let gx_val = *gx.get_unchecked(0) as usize;
                                         let tx_val = *tx.get_unchecked(0);
                                         let bg = v_grid_row[gx_val] + tx_val * d_grid_row[gx_val];
                                         let bg_i32 = (bg * 128.0).round() as i32;
@@ -1244,7 +1266,7 @@ impl FastExtractor {
                                     let mut rem_sq_int = 0i64;
                                     for i in 0..x {
                                         unsafe {
-                                            let gx0 = *bg_gx0.get_unchecked(rem_x + i);
+                                            let gx0 = *bg_gx0.get_unchecked(rem_x + i) as usize;
                                             let tx = *bg_tx.get_unchecked(rem_x + i);
                                             let bg_val = v_grid_row[gx0] + tx * d_grid_row[gx0];
                                             let bg_i32 = (bg_val * 128.0).round() as i32;
@@ -1411,10 +1433,10 @@ impl FastExtractor {
         ds: usize,
         options: &FastExtractOptions,
         is_first_variant: bool,
-        candidate_pixels: &mut Vec<usize>,
-        eroded_pixels: &mut Vec<usize>,
-        mask: &mut [bool],
-        stack: &mut Vec<usize>,
+        candidate_pixels: &mut Vec<u32>,
+        eroded_pixels: &mut Vec<u32>,
+        mask: &mut [u64],
+        stack: &mut Vec<u32>,
         cw_wx: &[f64],
         cw_wy: &[f64],
         cw_strides: &[usize],
@@ -1429,24 +1451,25 @@ impl FastExtractor {
             candidate_pixels.clear();
             for (idx, &v) in img.iter().enumerate() {
                 if v > threshold {
-                    candidate_pixels.push(idx);
+                    candidate_pixels.push(idx as u32);
                 }
             }
         } else {
-            candidate_pixels.retain(|&idx| unsafe { *img.get_unchecked(idx) > threshold });
+            candidate_pixels.retain(|&idx| unsafe { *img.get_unchecked(idx as usize) > threshold });
         }
 
-        let active_seeds: &[usize] = if options.binary_open {
+        let active_seeds: &[u32] = if options.binary_open {
             eroded_pixels.clear();
             for &idx in candidate_pixels.iter() {
-                let y = idx / width;
-                let x = idx % width;
+                let idx_u = idx as usize;
+                let y = idx_u / width;
+                let x = idx_u % width;
                 if y > 0 && y + 1 < height && x > 0 && x + 1 < width {
                     unsafe {
-                        if *img.get_unchecked(idx - 1) > threshold
-                            && *img.get_unchecked(idx + 1) > threshold
-                            && *img.get_unchecked(idx - width) > threshold
-                            && *img.get_unchecked(idx + width) > threshold
+                        if *img.get_unchecked(idx_u - 1) > threshold
+                            && *img.get_unchecked(idx_u + 1) > threshold
+                            && *img.get_unchecked(idx_u - width) > threshold
+                            && *img.get_unchecked(idx_u + width) > threshold
                         {
                             eroded_pixels.push(idx);
                         }
@@ -1458,17 +1481,18 @@ impl FastExtractor {
             candidate_pixels.as_slice()
         };
 
-        debug_assert!(mask.iter().all(|&b| !b));
-        let mask_ptr = mask.as_mut_ptr();
-        for &i in active_seeds {
-            unsafe {
-                *mask_ptr.add(i) = true;
-                if options.binary_open {
-                    *mask_ptr.add(i - 1) = true;
-                    *mask_ptr.add(i + 1) = true;
-                    *mask_ptr.add(i - width) = true;
-                    *mask_ptr.add(i + width) = true;
-                }
+        debug_assert!(mask.iter().all(|&w| w == 0));
+        let set_bit = |m: &mut [u64], i: usize| unsafe {
+            *m.get_unchecked_mut(i >> 6) |= 1u64 << (i & 63);
+        };
+        for &i_u32 in active_seeds {
+            let i = i_u32 as usize;
+            set_bit(mask, i);
+            if options.binary_open {
+                set_bit(mask, i - 1);
+                set_bit(mask, i + 1);
+                set_bit(mask, i - width);
+                set_bit(mask, i + width);
             }
         }
 
@@ -1482,13 +1506,16 @@ impl FastExtractor {
         let max_s = options.max_sum.unwrap_or(f64::MAX);
         let max_ar = options.max_axis_ratio.unwrap_or(f64::MAX);
 
-        for &seed in active_seeds {
-            if !mask[seed] {
+        for &seed_u32 in active_seeds {
+            let seed = seed_u32 as usize;
+            let seed_word = unsafe { mask.get_unchecked_mut(seed >> 6) };
+            let seed_bit = 1u64 << (seed & 63);
+            if (*seed_word & seed_bit) == 0 {
                 continue;
             }
-            mask[seed] = false;
+            *seed_word &= !seed_bit;
             let mut area = 1;
-            let val = img[seed].into();
+            let val = unsafe { *img.get_unchecked(seed) }.into();
             let mut sum = val;
             let sx = (seed % width) as f64;
             let sy = (seed / width) as f64;
@@ -1499,13 +1526,16 @@ impl FastExtractor {
             let mut sum_xy = sx * sy * val;
 
             stack.clear();
-            stack.push(seed);
-            while let Some(idx) = stack.pop() {
+            stack.push(seed_u32);
+            while let Some(idx_u32) = stack.pop() {
+                let idx = idx_u32 as usize;
                 let cy = idx / width;
                 let cx = idx % width;
                 let mut check_push = |ni: usize, n_cx: usize, n_cy: usize| unsafe {
-                    if *mask.get_unchecked(ni) {
-                        *mask.get_unchecked_mut(ni) = false;
+                    let w = mask.get_unchecked_mut(ni >> 6);
+                    let b = 1u64 << (ni & 63);
+                    if (*w & b) != 0 {
+                        *w &= !b;
                         area += 1;
                         let v = (*img.get_unchecked(ni)).into();
                         sum += v;
@@ -1516,7 +1546,7 @@ impl FastExtractor {
                         sum_xx += nx * nx * v;
                         sum_yy += ny * ny * v;
                         sum_xy += nx * ny * v;
-                        stack.push(ni);
+                        stack.push(ni as u32);
                     }
                 };
                 if cy > 0 {
@@ -1705,6 +1735,163 @@ mod tests {
                             assert_eq!(mc.y.to_bits(), sc.y.to_bits());
                             assert_eq!(mc.sum.to_bits(), sc.sum.to_bits());
                             assert_eq!(mc.area, sc.area);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_conditional_buffer_allocations() {
+        let w = 1280;
+        let h = 720;
+
+        // 1. 1x + GlobalRootSquare + BlockMedian (no crop)
+        let ext_1x_rms = FastExtractor::new(
+            w,
+            h,
+            FastExtractOptions {
+                bg_sub_mode: Some(FastBgSubMode::BlockMedian { block_size: 64 }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ext_1x_rms.image_i16.len(), w * h);
+        assert_eq!(ext_1x_rms.image_i32.capacity(), 0);
+        assert_eq!(ext_1x_rms.median_scratch_i16.capacity(), 0);
+        assert_eq!(ext_1x_rms.median_scratch_i32.capacity(), 0);
+        assert_eq!(ext_1x_rms.contiguous_u8.capacity(), 0);
+        assert_eq!(ext_1x_rms.mask.len(), (w * h).div_ceil(64));
+        assert!(!ext_1x_rms.bg_gx0.is_empty());
+
+        // 2. X2 downsample + GlobalRootSquare + LineMedian (no crop)
+        let ext_2x_line = FastExtractor::new(
+            w,
+            h,
+            FastExtractOptions {
+                downsample: FastDownsample::X2,
+                bg_sub_mode: Some(FastBgSubMode::LineMedian),
+                sigma_mode: FastSigmaMode::GlobalRootSquare,
+                ..Default::default()
+            },
+        );
+        let out_px = (w / 2) * (h / 2);
+        assert_eq!(ext_2x_line.image_i16.capacity(), 0);
+        assert_eq!(ext_2x_line.image_i32.len(), out_px);
+        assert_eq!(ext_2x_line.median_scratch_i16.capacity(), 0);
+        assert_eq!(ext_2x_line.median_scratch_i32.capacity(), 0);
+        assert_eq!(ext_2x_line.contiguous_u8.capacity(), 0);
+        assert_eq!(ext_2x_line.mask.len(), out_px.div_ceil(64));
+        assert_eq!(ext_2x_line.bg_gx0.capacity(), 0);
+        assert_eq!(ext_2x_line.bg_tx.capacity(), 0);
+        assert_eq!(ext_2x_line.bg_gy0.capacity(), 0);
+        assert_eq!(ext_2x_line.bg_gy1.capacity(), 0);
+        assert_eq!(ext_2x_line.bg_ty.capacity(), 0);
+        assert_eq!(ext_2x_line.bg_grid.capacity(), 0);
+        assert_eq!(ext_2x_line.block_hists.capacity(), 0);
+
+        // 3. X2 downsample + GlobalMedianAbs + crop
+        let mut ext_2x_mad_crop = FastExtractor::new(
+            w,
+            h,
+            FastExtractOptions {
+                downsample: FastDownsample::X2,
+                sigma_mode: FastSigmaMode::GlobalMedianAbs,
+                crop: Some((640, 360)),
+                ..Default::default()
+            },
+        );
+        let crop_w = 640;
+        let crop_h = 360;
+        let crop_out_px = (crop_w / 2) * (crop_h / 2);
+        assert_eq!(ext_2x_mad_crop.image_i16.capacity(), 0);
+        assert_eq!(ext_2x_mad_crop.image_i32.len(), crop_out_px);
+        assert_eq!(ext_2x_mad_crop.median_scratch_i16.capacity(), 0);
+        assert_eq!(ext_2x_mad_crop.median_scratch_i32.capacity(), crop_out_px);
+        assert_eq!(ext_2x_mad_crop.contiguous_u8.len(), crop_w * crop_h);
+
+        let img_u8 = Array2::from_elem((h, w), 10u8);
+        let _ = ext_2x_mad_crop.extract(&img_u8);
+        assert_eq!(ext_2x_mad_crop.median_scratch_i32.len(), crop_out_px);
+        assert!(ext_2x_mad_crop.mask.iter().all(|&word| word == 0));
+
+        // 4. Lazy allocation of contiguous_u8 on f32 extraction when uncropped
+        let mut ext_lazy = FastExtractor::new(64, 64, FastExtractOptions::default());
+        assert_eq!(ext_lazy.contiguous_u8.capacity(), 0);
+        let img_f32 = Array2::from_elem((64, 64), 0.1f32);
+        let _ = ext_lazy.extract_f32(&img_f32);
+        assert_eq!(ext_lazy.contiguous_u8.len(), 64 * 64);
+
+        // 5. Lazy allocation of contiguous_u8 on non-contiguous u8 view when uncropped
+        let mut ext_non_contig = FastExtractor::new(32, 32, FastExtractOptions::default());
+        assert_eq!(ext_non_contig.contiguous_u8.capacity(), 0);
+        let full_u8 = Array2::from_elem((64, 64), 15u8);
+        let view = full_u8.slice(ndarray::s![0..32, 0..32]);
+        let _ = ext_non_contig.extract(&view);
+        assert_eq!(ext_non_contig.contiguous_u8.len(), 32 * 32);
+    }
+
+    #[test]
+    fn test_all_modes_and_sigma_combinations() {
+        let w = 260; // intentionally non-multiple of 16 to exercise remainder loops
+        let h = 196;
+        let mut frame = vec![4u8; w * h];
+        let stars = [
+            (40usize, 36usize, 240u8),
+            (132, 96, 220),
+            (216, 156, 210),
+            (84, 160, 230),
+        ];
+        for &(sx, sy, peak) in &stars {
+            for dy in -6isize..=6 {
+                for dx in -6isize..=6 {
+                    let dist2 = (dx * dx + dy * dy) as u8;
+                    let val = peak.saturating_sub(dist2.saturating_mul(5));
+                    let x = (sx as isize + dx) as usize;
+                    let y = (sy as isize + dy) as usize;
+                    frame[y * w + x] = frame[y * w + x].max(val);
+                }
+            }
+        }
+        let img = Array2::from_shape_vec((h, w), frame).unwrap();
+
+        for ds in [FastDownsample::None, FastDownsample::X2, FastDownsample::X4] {
+            for bg_sub_mode in [
+                None,
+                Some(FastBgSubMode::GlobalMean),
+                Some(FastBgSubMode::GlobalMedian),
+                Some(FastBgSubMode::LineMedian),
+                Some(FastBgSubMode::BlockMedian { block_size: 32 }),
+            ] {
+                for sigma_mode in [
+                    FastSigmaMode::GlobalRootSquare,
+                    FastSigmaMode::GlobalMedianAbs,
+                ] {
+                    for approx in [false, true] {
+                        for binary_open in [false, true] {
+                            let opts = FastExtractOptions {
+                                sigma: 2.5,
+                                downsample: ds,
+                                bg_sub_mode,
+                                sigma_mode,
+                                binary_open,
+                                min_area: Some(1),
+                                max_area: Some(200),
+                                approximate_background: approx,
+                                ..Default::default()
+                            };
+                            let mut ext = FastExtractor::new(w, h, opts);
+                            let res1 = ext.extract(&img);
+                            let res2 = ext.extract(&img);
+                            assert_eq!(res1.centroids.len(), stars.len());
+                            assert_eq!(res1.centroids.len(), res2.centroids.len());
+                            assert!(ext.mask.iter().all(|&word| word == 0));
+                            for (c1, c2) in res1.centroids.iter().zip(res2.centroids.iter()) {
+                                assert_eq!(c1.x.to_bits(), c2.x.to_bits());
+                                assert_eq!(c1.y.to_bits(), c2.y.to_bits());
+                                assert_eq!(c1.sum.to_bits(), c2.sum.to_bits());
+                                assert_eq!(c1.area, c2.area);
+                            }
                         }
                     }
                 }
