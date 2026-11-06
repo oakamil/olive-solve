@@ -219,6 +219,9 @@ pub struct FastExtractor {
     cw_strides: Vec<usize>,
 
     // Morphological & Centroiding buffers
+    block_hists: Vec<u32>,
+    candidate_pixels: Vec<usize>,
+    eroded_pixels: Vec<usize>,
     mask: Vec<bool>,
     stack: Vec<usize>,
 }
@@ -276,6 +279,7 @@ impl FastExtractor {
         let out_pixels = out_width * out_height;
 
         let mut bg_grid = Vec::new();
+        let mut block_hists = Vec::new();
         let mut bg_gx0 = vec![0; out_width];
         let mut bg_tx = vec![0.0; out_width];
         let mut bg_gy0 = vec![0; out_height];
@@ -287,6 +291,12 @@ impl FastExtractor {
             let grid_w = out_width.div_ceil(block_size);
             let grid_h = out_height.div_ceil(block_size);
             bg_grid.resize(grid_w * grid_h, 0.0);
+            let hist_bins = match ds {
+                1 => 256,
+                2 => 1024,
+                _ => 4096,
+            };
+            block_hists.resize(grid_w * hist_bins, 0);
 
             for x in 0..out_width {
                 let cx = (x as f32 / block_size as f32) - 0.5;
@@ -311,14 +321,14 @@ impl FastExtractor {
         let mut cw_strides = Vec::new();
 
         if let Some(mut window) = options.centroid_window {
-            window = window.min(height).min(width);
+            window = window.min(out_height).min(out_width);
             cw_wx.reserve(window);
             cw_wy.reserve(window);
             cw_strides.reserve(window);
             for w in 0..window {
                 cw_wx.push(w as f64 + 0.5);
                 cw_wy.push(w as f64 + 0.5);
-                cw_strides.push(w * width);
+                cw_strides.push(w * out_width);
             }
         }
 
@@ -346,6 +356,9 @@ impl FastExtractor {
             cw_wx,
             cw_wy,
             cw_strides,
+            block_hists,
+            candidate_pixels: Vec::with_capacity(2048),
+            eroded_pixels: Vec::with_capacity(512),
             mask: vec![false; out_pixels],
             stack: Vec::with_capacity(1024),
         }
@@ -614,7 +627,9 @@ impl FastExtractor {
                     }
                     FastBgSubMode::GlobalMedian => {
                         // OPTIMIZATION: Row-skipping histogram pass is fast for finding the median.
-                        let mut hist = [0u32; 4096];
+                        let hist_bins = if ds == 2 { 1024 } else { 4096 };
+                        let mut hist_buf = [0u32; 4096];
+                        let hist = &mut hist_buf[..hist_bins];
                         let mut count = 0;
                         let step = if self.options.approximate_background {
                             4
@@ -664,7 +679,9 @@ impl FastExtractor {
                             + n_f64 * med_f64 * med_f64
                     }
                     FastBgSubMode::LineMedian => {
-                        let mut hist = [0u32; 4096];
+                        let hist_bins = if ds == 2 { 1024 } else { 4096 };
+                        let mut hist_buf = [0u32; 4096];
+                        let hist = &mut hist_buf[..hist_bins];
                         let mut total_sum_sq = 0.0;
                         let o_rows = self.image_i32.chunks_exact_mut(self.out_width);
                         let i_rows = self.downsampled_u32.chunks_exact(self.out_width);
@@ -735,7 +752,8 @@ impl FastExtractor {
                     FastBgSubMode::BlockMedian { block_size } => {
                         let grid_w = self.out_width.div_ceil(block_size);
                         let grid_h = self.out_height.div_ceil(block_size);
-                        let mut hists = vec![0u32; grid_w * 4096];
+                        let hist_bins = if ds == 2 { 1024 } else { 4096 };
+                        let hists = &mut self.block_hists[..grid_w * hist_bins];
 
                         for gy in 0..grid_h {
                             hists.fill(0);
@@ -754,7 +772,7 @@ impl FastExtractor {
                                 for gx in 0..grid_w {
                                     let start_x = gx * block_size;
                                     let end_x = (start_x + block_size).min(self.out_width);
-                                    let hist_offset = gx * 4096;
+                                    let hist_offset = gx * hist_bins;
                                     for x in start_x..end_x {
                                         unsafe {
                                             let p = *row.get_unchecked(x);
@@ -765,7 +783,7 @@ impl FastExtractor {
                             }
                             let bg_row = &mut self.bg_grid[gy * grid_w..(gy + 1) * grid_w];
                             for gx in 0..grid_w {
-                                let hist = &hists[gx * 4096..(gx + 1) * 4096];
+                                let hist = &hists[gx * hist_bins..(gx + 1) * hist_bins];
                                 let start_x = gx * block_size;
                                 let end_x = (start_x + block_size).min(self.out_width);
                                 let step = if self.options.approximate_background {
@@ -1094,7 +1112,7 @@ impl FastExtractor {
                     FastBgSubMode::BlockMedian { block_size } => {
                         let grid_w = self.width.div_ceil(block_size);
                         let grid_h = self.height.div_ceil(block_size);
-                        let mut hists = vec![0u32; grid_w * 256];
+                        let hists = &mut self.block_hists[..grid_w * 256];
                         for gy in 0..grid_h {
                             hists.fill(0);
                             let start_y = gy * block_size;
@@ -1289,24 +1307,44 @@ impl FastExtractor {
             0.0
         };
 
-        let mut results = Vec::with_capacity(variants.len());
-        for variant in variants {
-            let mut opt = self.options.clone();
-            if let Some(s) = variant.sigma {
-                opt.sigma = s;
-            }
-            if let Some(nf) = variant.noise_filter {
-                opt.binary_open = nf;
-            }
-            if let Some(ma) = variant.min_area {
-                opt.min_area = Some(ma);
-            }
-            if let Some(m_ar) = variant.max_area {
-                opt.max_area = Some(m_ar);
-            }
-            if let Some(ref vc) = variant.virtual_crops {
-                opt.virtual_crops = vc.clone();
-            }
+        // Sort variant indices by ascending sigma so the most permissive variant (lowest threshold)
+        // always runs first, narrowing candidate_pixels in-place for stricter variants while
+        // preserving the caller's original output order.
+        let mut variant_order: Vec<(usize, f32)> = variants
+            .iter()
+            .enumerate()
+            .map(|(idx, v)| (idx, v.sigma.unwrap_or(self.options.sigma)))
+            .collect();
+        variant_order.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+        let mut results: Vec<FastExtractionResult> = (0..variants.len())
+            .map(|_| FastExtractionResult::default())
+            .collect();
+
+        for (step_idx, &(orig_idx, sigma)) in variant_order.iter().enumerate() {
+            let variant = &variants[orig_idx];
+            let is_first_variant = step_idx == 0;
+
+            let opt = FastExtractOptions {
+                sigma,
+                downsample: self.options.downsample,
+                bg_sub_mode: self.options.bg_sub_mode,
+                sigma_mode: self.options.sigma_mode,
+                binary_open: variant.noise_filter.unwrap_or(self.options.binary_open),
+                centroid_window: self.options.centroid_window,
+                max_area: variant.max_area.or(self.options.max_area),
+                min_area: variant.min_area.or(self.options.min_area),
+                max_sum: self.options.max_sum,
+                min_sum: self.options.min_sum,
+                max_axis_ratio: self.options.max_axis_ratio,
+                crop: self.options.crop,
+                virtual_crops: None,
+                approximate_background: self.options.approximate_background,
+            };
+            let active_vc = variant
+                .virtual_crops
+                .as_ref()
+                .unwrap_or(&self.options.virtual_crops);
 
             let threshold_f32 = base_noise * opt.sigma;
 
@@ -1319,6 +1357,9 @@ impl FastExtractor {
                     threshold_scaled,
                     ds,
                     &opt,
+                    is_first_variant,
+                    &mut self.candidate_pixels,
+                    &mut self.eroded_pixels,
                     &mut self.mask,
                     &mut self.stack,
                     &self.cw_wx,
@@ -1334,6 +1375,9 @@ impl FastExtractor {
                     threshold_scaled,
                     1,
                     &opt,
+                    is_first_variant,
+                    &mut self.candidate_pixels,
+                    &mut self.eroded_pixels,
                     &mut self.mask,
                     &mut self.stack,
                     &self.cw_wx,
@@ -1351,9 +1395,7 @@ impl FastExtractor {
                 }
             }
 
-            let final_result =
-                self.apply_virtual_crops(extracted, &opt.virtual_crops, background_level);
-            results.push(final_result);
+            results[orig_idx] = self.apply_virtual_crops(extracted, active_vc, background_level);
         }
 
         results
@@ -1368,6 +1410,9 @@ impl FastExtractor {
         threshold: T,
         ds: usize,
         options: &FastExtractOptions,
+        is_first_variant: bool,
+        candidate_pixels: &mut Vec<usize>,
+        eroded_pixels: &mut Vec<usize>,
         mask: &mut [bool],
         stack: &mut Vec<usize>,
         cw_wx: &[f64],
@@ -1377,44 +1422,45 @@ impl FastExtractor {
     where
         T: Copy + PartialOrd + Into<f64>,
     {
-        // 1. Fast binary erosion + threshold
-        // Rather than thresholds then eroding in two passes, we perform a fused 3x3 cross
-        // morphological evaluation directly off the scalar threshold.
-        let mut eroded_pixels = Vec::with_capacity(128);
-        if options.binary_open {
-            for y in 1..height - 1 {
-                let row_offset = y * width;
-                let p_prev = img[(y - 1) * width..y * width].as_ptr();
-                let p_curr = img[y * width..(y + 1) * width].as_ptr();
-                let p_next = img[(y + 1) * width..(y + 2) * width].as_ptr();
-                for x in 1..width - 1 {
+        // 1. Fast threshold + optional binary erosion
+        // The first (most permissive) variant scans `img` once; subsequent stricter variants
+        // narrow `candidate_pixels` in-place without re-scanning the image.
+        if is_first_variant {
+            candidate_pixels.clear();
+            for (idx, &v) in img.iter().enumerate() {
+                if v > threshold {
+                    candidate_pixels.push(idx);
+                }
+            }
+        } else {
+            candidate_pixels.retain(|&idx| unsafe { *img.get_unchecked(idx) > threshold });
+        }
+
+        let active_seeds: &[usize] = if options.binary_open {
+            eroded_pixels.clear();
+            for &idx in candidate_pixels.iter() {
+                let y = idx / width;
+                let x = idx % width;
+                if y > 0 && y + 1 < height && x > 0 && x + 1 < width {
                     unsafe {
-                        if *p_curr.add(x) > threshold
-                            && *p_curr.add(x - 1) > threshold
-                            && *p_curr.add(x + 1) > threshold
-                            && *p_prev.add(x) > threshold
-                            && *p_next.add(x) > threshold
+                        if *img.get_unchecked(idx - 1) > threshold
+                            && *img.get_unchecked(idx + 1) > threshold
+                            && *img.get_unchecked(idx - width) > threshold
+                            && *img.get_unchecked(idx + width) > threshold
                         {
-                            eroded_pixels.push(row_offset + x);
+                            eroded_pixels.push(idx);
                         }
                     }
                 }
             }
+            eroded_pixels.as_slice()
         } else {
-            for y in 0..height {
-                let row_offset = y * width;
-                let r_curr = &img[row_offset..row_offset + width];
-                for x in 0..width {
-                    if r_curr[x] > threshold {
-                        eroded_pixels.push(row_offset + x);
-                    }
-                }
-            }
-        }
+            candidate_pixels.as_slice()
+        };
 
-        mask.fill(false);
+        debug_assert!(mask.iter().all(|&b| !b));
         let mask_ptr = mask.as_mut_ptr();
-        for &i in &eroded_pixels {
+        for &i in active_seeds {
             unsafe {
                 *mask_ptr.add(i) = true;
                 if options.binary_open {
@@ -1436,7 +1482,7 @@ impl FastExtractor {
         let max_s = options.max_sum.unwrap_or(f64::MAX);
         let max_ar = options.max_axis_ratio.unwrap_or(f64::MAX);
 
-        for &seed in &eroded_pixels {
+        for &seed in active_seeds {
             if !mask[seed] {
                 continue;
             }
@@ -1563,5 +1609,106 @@ impl FastExtractor {
             }
         }
         extracted
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    #[test]
+    fn test_multi_variant_equivalence_and_cw_downsample() {
+        let w = 640;
+        let h = 480;
+        let mut frame = vec![18u8; w * h];
+
+        // Add synthetic stars including one near the bottom edge to exercise cw_strides with X2 downsample
+        let stars = [
+            (120usize, 80usize, 220u8),
+            (310, 210, 140),
+            (500, 350, 90),
+            (250, 474, 200),
+        ];
+        for &(sx, sy, peak) in &stars {
+            for dy in -3isize..=3 {
+                for dx in -3isize..=3 {
+                    let dist2 = (dx * dx + dy * dy) as u8;
+                    let val = peak.saturating_sub(dist2.saturating_mul(18));
+                    let x = (sx as isize + dx) as usize;
+                    let y = (sy as isize + dy) as usize;
+                    frame[y * w + x] = frame[y * w + x].max(val);
+                }
+            }
+        }
+        let img = Array2::from_shape_vec((h, w), frame).unwrap();
+
+        for ds in [FastDownsample::None, FastDownsample::X2, FastDownsample::X4] {
+            for bg_sub_mode in [
+                Some(FastBgSubMode::BlockMedian { block_size: 32 }),
+                Some(FastBgSubMode::LineMedian),
+                Some(FastBgSubMode::GlobalMedian),
+            ] {
+                for cw in [None, Some(5)] {
+                    let base_opts = FastExtractOptions {
+                        sigma: 3.5,
+                        downsample: ds,
+                        bg_sub_mode,
+                        sigma_mode: FastSigmaMode::GlobalMedianAbs,
+                        centroid_window: cw,
+                        approximate_background: true,
+                        ..Default::default()
+                    };
+
+                    // Pass strict variant first (5.0), then permissive (2.5), then intermediate (3.5)
+                    let variants = [
+                        FastExtractOptionsUpdate {
+                            sigma: Some(5.0),
+                            min_area: Some(1),
+                            max_area: Some(100),
+                            ..Default::default()
+                        },
+                        FastExtractOptionsUpdate {
+                            sigma: Some(2.5),
+                            min_area: Some(2),
+                            max_area: Some(100),
+                            ..Default::default()
+                        },
+                        FastExtractOptionsUpdate {
+                            sigma: Some(3.5),
+                            min_area: Some(1),
+                            max_area: Some(80),
+                            ..Default::default()
+                        },
+                    ];
+
+                    let mut multi_ext = FastExtractor::new(w, h, base_opts.clone());
+                    let multi_res = multi_ext.extract_variants(&img, &variants);
+                    assert_eq!(multi_res.len(), variants.len());
+
+                    for (v_idx, var) in variants.iter().enumerate() {
+                        let mut single_ext = FastExtractor::new(w, h, base_opts.clone());
+                        single_ext.update_options(var.clone());
+                        let single_res = single_ext.extract(&img);
+
+                        assert_eq!(
+                            multi_res[v_idx].background_level.to_bits(),
+                            single_res.background_level.to_bits()
+                        );
+                        assert_eq!(multi_res[v_idx].centroids.len(), single_res.centroids.len());
+                        for (mc, sc) in multi_res[v_idx]
+                            .centroids
+                            .iter()
+                            .zip(single_res.centroids.iter())
+                        {
+                            assert_eq!(mc.x.to_bits(), sc.x.to_bits());
+                            assert_eq!(mc.y.to_bits(), sc.y.to_bits());
+                            assert_eq!(mc.sum.to_bits(), sc.sum.to_bits());
+                            assert_eq!(mc.area, sc.area);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
