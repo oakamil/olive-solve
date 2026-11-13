@@ -1162,8 +1162,8 @@ fn generate_python_test_fixtures() {
 
                     let file = File::create(&zip_path).unwrap();
                     let mut zip = ZipWriter::new(file);
-                    let options =
-                        SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+                    let options = SimpleFileOptions::default()
+                        .compression_method(CompressionMethod::Deflated);
 
                     zip.start_file("results.json", options).unwrap();
                     let json_bytes = serde_json::to_vec_pretty(&all_results).unwrap();
@@ -1394,15 +1394,8 @@ fn test_performance_vs_cedar() {
                 // Run Cedar Detect Algorithm
                 let start_cedar = Instant::now();
                 let noise_estimate = estimate_noise_from_image(cedar_img);
-                let _cedar_result = get_stars_from_image(
-                    cedar_img,
-                    noise_estimate,
-                    8.0,
-                    false,
-                    cedar_ds,
-                    true,
-                    false,
-                );
+                let _cedar_result =
+                    get_stars_from_image(cedar_img, None, noise_estimate, 8.0, cedar_ds);
                 total_cedar_time += start_cedar.elapsed();
             }
         }
@@ -1594,12 +1587,10 @@ fn test_grayscale_vs_cedar() {
         let noise_estimate = estimate_noise_from_image(&luma_img);
         let cedar_result = get_stars_from_image(
             &luma_img,
+            None,
             noise_estimate,
             8.0,
-            false,
             1, // ds
-            true,
-            false,
         );
         let cedar_count = cedar_result.0.len();
 

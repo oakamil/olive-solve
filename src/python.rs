@@ -5,6 +5,79 @@ use crate::FusedSolver;
 use numpy::PyReadonlyArray2;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
+use std::path::PathBuf;
+use std::sync::Arc;
+use olive_imu::storage::{FileStorage, PersistentStorage};
+
+fn default_storage_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .unwrap_or_default();
+    PathBuf::from(home).join(".olive_solve")
+}
+
+struct PyPersistentStorageAdapter {
+    obj: Py<PyAny>,
+}
+
+impl PersistentStorage for PyPersistentStorageAdapter {
+    fn get(&self, key: &str) -> Option<String> {
+        Python::try_attach(|py| {
+            self.obj
+                .bind(py)
+                .call_method1("get", (key,))
+                .and_then(|val| val.extract::<Option<String>>())
+                .unwrap_or_else(|e| {
+                    log::warn!("Python storage.get('{}') failed: {}", key, e);
+                    None
+                })
+        })
+        .flatten()
+    }
+
+    fn set(&self, key: &str, value: &str) {
+        let _ = Python::try_attach(|py| {
+            if let Err(e) = self.obj.bind(py).call_method1("set", (key, value)) {
+                log::error!("Python storage.set('{}', ...) failed: {}", key, e);
+            }
+        });
+    }
+
+    fn remove(&self, key: &str) {
+        let _ = Python::try_attach(|py| {
+            if let Err(e) = self.obj.bind(py).call_method1("remove", (key,)) {
+                log::warn!("Python storage.remove('{}') failed: {}", key, e);
+            }
+        });
+    }
+}
+
+fn parse_storage<'py>(
+    storage: Option<Bound<'py, PyAny>>,
+) -> PyResult<Option<Arc<dyn PersistentStorage>>> {
+    let default_storage =
+        || -> Arc<dyn PersistentStorage> { Arc::new(FileStorage::new(default_storage_dir())) };
+
+    let Some(obj) = storage.filter(|o| !o.is_none()) else {
+        return Ok(Some(default_storage()));
+    };
+
+    if let Ok(enabled) = obj.extract::<bool>() {
+        return Ok(enabled.then(default_storage));
+    }
+
+    if let Ok(path) = obj.extract::<PathBuf>() {
+        return Ok(Some(Arc::new(FileStorage::new(path))));
+    }
+
+    if obj.hasattr("get")? && obj.hasattr("set")? && obj.hasattr("remove")? {
+        Ok(Some(Arc::new(PyPersistentStorageAdapter { obj: obj.unbind() })))
+    } else {
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "storage must be None (default), bool, str/Path, or an object implementing get(key), set(key, value), and remove(key)",
+        ))
+    }
+}
 
 #[pyclass(name = "FusedSolver")]
 /// A Python wrapper for the FusedSolver, providing plate solving and star extraction.
@@ -16,14 +89,24 @@ pub struct PyFusedSolver {
 #[pymethods]
 impl PyFusedSolver {
     #[new]
-    #[pyo3(signature = (database_path, imu_type=None, enable_accel=true))]
+    #[pyo3(signature = (database_path, imu_type=None, enable_accel=true, storage=None))]
     /// Initializes a new FusedSolver instance.
     ///
     /// Args:
     ///     database_path (str): The file path to the npz star database.
     ///     imu_type (str, optional): The specific IMU to use (e.g. "bno085", "bmi160", "auto", "none"). Defaults to auto-detection.
     ///     enable_accel (bool, optional): Whether to enable accelerometer hardware/features. Defaults to true.
-    pub fn new(database_path: &str, imu_type: Option<&str>, enable_accel: bool) -> PyResult<Self> {
+    ///     storage (str, Path, bool, or object, optional): Storage for persisting IMU calibration parameters across runs.
+    ///         Defaults to None (which persists to ~/.olive_solve/imu_calibration.txt).
+    ///         Pass False to disable persistence (in-memory only).
+    ///         Pass a directory path string or pathlib.Path to store in a custom directory.
+    ///         Pass a custom object implementing get(key), set(key, value), and remove(key).
+    pub fn new<'py>(
+        database_path: &str,
+        imu_type: Option<&str>,
+        enable_accel: bool,
+        storage: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Self> {
         let rust_imu_type = match imu_type {
             Some(s) => Some(
                 s.parse::<crate::ImuType>()
@@ -32,10 +115,12 @@ impl PyFusedSolver {
             None => None,
         };
 
+        let rust_storage = parse_storage(storage)?;
+
         let inner = FusedSolver::new(
             std::path::Path::new(database_path),
             rust_imu_type,
-            None,
+            rust_storage,
             enable_accel,
         )
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
@@ -60,9 +145,8 @@ impl PyFusedSolver {
         let options = tetra3::extractor::ExtractOptions::from_kwargs(kwargs)?;
         let img_view = image.as_array();
 
-        let result = self
-            .inner
-            .extract(&img_view, options)
+        let result = py
+            .detach(|| self.inner.extract(&img_view, options))
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
         Ok(tetra3::python::centroids_to_numpy(py, &result.centroids))
@@ -88,10 +172,10 @@ impl PyFusedSolver {
 
         let result = if let Ok(img_u8) = image.extract::<numpy::PyReadonlyArray2<u8>>() {
             let img_view = img_u8.as_array();
-            self.inner.extract_fast(&img_view, options)
+            py.detach(|| self.inner.extract_fast(&img_view, options))
         } else if let Ok(img_f32) = image.extract::<numpy::PyReadonlyArray2<f32>>() {
             let img_view = img_f32.as_array();
-            self.inner.extract_fast(&img_view, options)
+            py.detach(|| self.inner.extract_fast(&img_view, options))
         } else {
             return Err(pyo3::exceptions::PyTypeError::new_err(
                 "Image must be a 2D NumPy array of u8 or f32",
@@ -149,12 +233,16 @@ impl PyFusedSolver {
 
         let results = if let Ok(img_u8) = image.extract::<numpy::PyReadonlyArray2<u8>>() {
             let img_view = img_u8.as_array();
-            self.inner
-                .get_centroids_from_image_variants(&img_view, options, &rust_variants)
+            py.detach(|| {
+                self.inner
+                    .get_centroids_from_image_variants(&img_view, options, &rust_variants)
+            })
         } else if let Ok(img_f32) = image.extract::<numpy::PyReadonlyArray2<f32>>() {
             let img_view = img_f32.as_array();
-            self.inner
-                .get_centroids_from_image_variants(&img_view, options, &rust_variants)
+            py.detach(|| {
+                self.inner
+                    .get_centroids_from_image_variants(&img_view, options, &rust_variants)
+            })
         } else {
             return Err(pyo3::exceptions::PyTypeError::new_err(
                 "Image must be a 2D NumPy array of u8 or f32",
@@ -200,9 +288,11 @@ impl PyFusedSolver {
         let solve_options = tetra3::solver::SolveOptions::from_kwargs(kwargs)?;
         let img_view = image.as_array();
 
-        let (solution, ext_time) = self
-            .inner
-            .solve_from_image(&img_view, extract_options, solve_options, None)
+        let (solution, ext_time) = py
+            .detach(|| {
+                self.inner
+                    .solve_from_image(&img_view, extract_options, solve_options, None)
+            })
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
         solution.to_dict(py, Some(ext_time))
@@ -226,21 +316,26 @@ impl PyFusedSolver {
         let extract_options = tetra3::fast_extractor::FastExtractOptions::from_kwargs(kwargs)?;
         let solve_options = tetra3::solver::SolveOptions::from_kwargs(kwargs)?;
 
-        let (solution, ext_time) =
-            if let Ok(img_u8) = image.extract::<numpy::PyReadonlyArray2<u8>>() {
-                let img_view = img_u8.as_array();
+        let (solution, ext_time) = if let Ok(img_u8) =
+            image.extract::<numpy::PyReadonlyArray2<u8>>()
+        {
+            let img_view = img_u8.as_array();
+            py.detach(|| {
                 self.inner
                     .solve_from_image_fast(&img_view, extract_options, solve_options, None)
-            } else if let Ok(img_f32) = image.extract::<numpy::PyReadonlyArray2<f32>>() {
-                let img_view = img_f32.as_array();
+            })
+        } else if let Ok(img_f32) = image.extract::<numpy::PyReadonlyArray2<f32>>() {
+            let img_view = img_f32.as_array();
+            py.detach(|| {
                 self.inner
                     .solve_from_image_fast(&img_view, extract_options, solve_options, None)
-            } else {
-                return Err(pyo3::exceptions::PyTypeError::new_err(
-                    "Image must be a 2D NumPy array of u8 or f32",
-                ));
-            }
-            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+            })
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "Image must be a 2D NumPy array of u8 or f32",
+            ));
+        }
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
         solution.to_dict(py, Some(ext_time))
     }
@@ -264,9 +359,11 @@ impl PyFusedSolver {
     ) -> PyResult<Bound<'py, PyDict>> {
         let solve_options = tetra3::solver::SolveOptions::from_kwargs(kwargs)?;
         let cents_view = centroids.as_array().to_owned();
-        let solution = self
-            .inner
-            .solve_from_centroids(&cents_view, size, solve_options, None)
+        let solution = py
+            .detach(|| {
+                self.inner
+                    .solve_from_centroids(&cents_view, size, solve_options, None)
+            })
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         solution.to_dict(py, None)
     }
@@ -296,9 +393,11 @@ impl PyFusedSolver {
             centroids_list.iter().map(|c| c.as_array()).collect();
         let batch: Vec<(ndarray::Array2<f64>, Option<tetra3::extractor::Crop>)> =
             cents_views.iter().map(|v| (v.to_owned(), None)).collect();
-        let batch_solution = self
-            .inner
-            .solve_from_centroids_batch(&batch, size, solve_options, None)
+        let batch_solution = py
+            .detach(|| {
+                self.inner
+                    .solve_from_centroids_batch(&batch, size, solve_options, None)
+            })
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         let dict = batch_solution.solution.to_dict(py, None)?;
         dict.set_item("crop_index", batch_solution.crop_index)?;
@@ -315,8 +414,8 @@ impl PyFusedSolver {
     /// Args:
     ///     lat (float): Latitude in degrees.
     ///     lon (float): Longitude in degrees.
-    pub fn set_observer_location(&self, lat: f64, lon: f64) {
-        self.inner.set_observer_location(lat, lon);
+    pub fn set_observer_location<'py>(&self, py: Python<'py>, lat: f64, lon: f64) {
+        py.detach(|| self.inner.set_observer_location(lat, lon));
     }
 
     /// Attempts to initialize and start the configured IMU hardware (e.g. BNO080 or BMI160)
@@ -324,22 +423,20 @@ impl PyFusedSolver {
     ///
     /// Returns:
     ///     bool: True if IMU successfully started.
-    pub fn start_imu(&self) -> PyResult<bool> {
-        self.inner
-            .start_imu()
+    pub fn start_imu<'py>(&self, py: Python<'py>) -> PyResult<bool> {
+        py.detach(|| self.inner.start_imu())
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 
     /// Stops the IMU and drops the background polling thread. Safe to call if not started.
-    pub fn stop_imu(&self) -> PyResult<()> {
-        self.inner
-            .stop_imu()
+    pub fn stop_imu<'py>(&self, py: Python<'py>) -> PyResult<()> {
+        py.detach(|| self.inner.stop_imu())
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 
     /// Resets the internal IMU zero-bias and deletes the SVD calibration matrix from persistent storage.
-    pub fn reset_calibration(&self) {
-        self.inner.reset_calibration();
+    pub fn reset_calibration<'py>(&self, py: Python<'py>) {
+        py.detach(|| self.inner.reset_calibration());
     }
 
     /// Fetches the latest known orientation of the device.
@@ -347,7 +444,8 @@ impl PyFusedSolver {
     /// Returns:
     ///     dict: Dictionary containing ra, dec, roll, source, timestamp
     pub fn get_latest_position<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        if let Some(pos) = self.inner.get_latest_position() {
+        let maybe_pos = py.detach(|| self.inner.get_latest_position());
+        if let Some(pos) = maybe_pos {
             let dict = PyDict::new(py);
             dict.set_item("ra", pos.ra)?;
             dict.set_item("dec", pos.dec)?;
@@ -397,7 +495,7 @@ impl PyFusedSolver {
     ///     ValueError: If coordinate values cannot be parsed or are invalid.
     pub fn update_position<'py>(
         &self,
-        _py: Python<'py>,
+        py: Python<'py>,
         ra_or_dict: Bound<'py, PyAny>,
         dec: Option<f64>,
         roll: Option<f64>,
@@ -451,13 +549,15 @@ impl PyFusedSolver {
             }
         });
 
-        Ok(self.inner.update_position(
-            final_ra,
-            final_dec,
-            Some(final_roll),
-            rust_timestamp,
-            pointing_only,
-        ))
+        Ok(py.detach(|| {
+            self.inner.update_position(
+                final_ra,
+                final_dec,
+                Some(final_roll),
+                rust_timestamp,
+                pointing_only,
+            )
+        }))
     }
 
     /// Fetches the latest real-time hardware telemetry from the IMU.
@@ -465,7 +565,8 @@ impl PyFusedSolver {
     /// Returns:
     ///     dict: Dictionary containing timestamp, gyro, gravity_vector, relative_gyro_quaternion, hardware_quaternion, motion_state.
     pub fn get_sensor_data<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        if let Some(data) = self.inner.get_sensor_data() {
+        let maybe_data = py.detach(|| self.inner.get_sensor_data());
+        if let Some(data) = maybe_data {
             let dict = PyDict::new(py);
             let dt = data
                 .timestamp
@@ -503,8 +604,9 @@ impl PyFusedSolver {
     }
 
     /// Retrieves the real-time motion stability state from the IMU hardware, if running.
-    pub fn get_motion_state(&self) -> Option<String> {
-        self.inner.get_motion_state().map(|s| format!("{:?}", s))
+    pub fn get_motion_state<'py>(&self, py: Python<'py>) -> Option<String> {
+        py.detach(|| self.inner.get_motion_state())
+            .map(|s| format!("{:?}", s))
     }
 
     /// Retrieves the real-time calibration metrics from the IMU hardware, if running.
@@ -512,7 +614,8 @@ impl PyFusedSolver {
         &self,
         py: Python<'py>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        if let Some(status) = self.inner.get_calibration_status() {
+        let maybe_status = py.detach(|| self.inner.get_calibration_status());
+        if let Some(status) = maybe_status {
             let dict = PyDict::new(py);
             dict.set_item("transform_error_fraction", status.transform_error_fraction)?;
             dict.set_item("camera_view_gyro_axis", status.camera_view_gyro_axis)?;
@@ -530,4 +633,15 @@ impl PyFusedSolver {
 fn olive_solve(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFusedSolver>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_storage_dir() {
+        let dir = default_storage_dir();
+        assert!(dir.ends_with(".olive_solve"));
+    }
 }

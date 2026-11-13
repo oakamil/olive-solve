@@ -42,6 +42,7 @@ A robust integration framework for inertial measurement units.
   rate gyroscope drift.
 * **Timing Synchronization**: Employs queue-draining and back-dating timestamp strategies to map sensor-relative measurements to host wall-clock time, absorbing I2C jitter and preventing timeline drift.
 * **Asynchronous Polling**: A dedicated OS thread handles blocking I2C transactions to maintain high polling rates (100 Hz+) without stalling the main `tokio` async runtime.
+* **Persistent Calibration Storage**: Supports persisting SVD transformation matrices (`mount_q`) and bias calibration across sessions (defaulting to `~/.olive_solve/imu_calibration.txt` in Python). Prevents loss of alignment between reboots or mount mode changes.
 * **Sensor Telemetry**: Exposes real-time hardware telemetry (gyro, gravity vectors, and integrated quaternions if available) via the `FusedSolver`.
 
 ### Fused Solver
@@ -49,6 +50,7 @@ A robust integration framework for inertial measurement units.
 The `FusedSolver` provides an integrated architecture that bridges camera plate-solving and high-speed IMU telemetry.
 
 * **Continuous Orientation Tracking**: By coupling sparse, high-accuracy plate solves with dense, real-time IMU gyroscope data, the solver maintains orientation between camera exposures and during large slews.
+* **Observer Coordinate Anchoring**: Maps camera celestial solutions (RA/Dec) to topocentric horizontal coordinates (Alt/Az) for IMU tracking. Emits rate-limited warnings if IMU tracking is active without observer coordinates configured.
 * **Batch Processing**: `get_centroids_from_image_variants` and `solve_from_centroid_batch` allow executing multiple extraction/solving variants over a single image efficiently.
 * **Low-Confidence Fallback**: When exact matches are constrained, the solver includes fallback heuristics to verify and accept motion-correlated low-confidence matches.
 
@@ -82,8 +84,35 @@ To build the integrated `FusedSolver` library with Python bindings:
 
 ```bash
 cargo build --release --features python
-# Verify API functionality
-python3 test_python_api.py
+# Or install in active virtual environment with maturin:
+maturin develop
+```
+
+##### Python Usage Example
+
+```python
+import olive_solve
+from pathlib import Path
+from typing import Optional
+
+# 1. Default persistent storage (~/.olive_solve/imu_calibration.txt)
+solver = olive_solve.FusedSolver("path/to/database.npz", imu_type="auto")
+solver.set_observer_location(lat=34.05, lon=-118.25)
+
+# 2. In-memory only (disable disk persistence)
+solver_mem = olive_solve.FusedSolver("path/to/database.npz", storage=False)
+
+# 3. Custom directory path (stores /var/lib/my_app/imu_calibration.txt)
+solver_custom = olive_solve.FusedSolver("path/to/database.npz", storage="/var/lib/my_app")
+# pathlib.Path is also supported: storage=Path("/var/lib/my_app")
+
+# 4. Custom duck-typed storage adapter
+class MyStorage:
+    def get(self, key: str) -> Optional[str]: ...
+    def set(self, key: str, value: str) -> None: ...
+    def remove(self, key: str) -> None: ...
+
+solver_adapter = olive_solve.FusedSolver("path/to/database.npz", storage=MyStorage())
 ```
 
 #### Embedded Platforms & 32-Bit Solver

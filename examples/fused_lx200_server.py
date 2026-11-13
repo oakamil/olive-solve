@@ -279,6 +279,7 @@ class Lx200Controller:
         self.site_lat: Optional[float] = None
         self.site_lon: Optional[float] = None
         self.imu_started = False
+        self.imu_attempted = False
 
         # Target coordinates and pending time commands
         self.target_ra: Optional[float] = None
@@ -329,7 +330,8 @@ class Lx200Controller:
         """Sets observer location on solver and starts IMU once both latitude and longitude are known."""
         if self.site_lat is not None and self.site_lon is not None:
             self.solver.set_observer_location(self.site_lat, self.site_lon)
-            if not self.imu_started:
+            if not self.imu_attempted:
+                self.imu_attempted = True
                 try:
                     res = self.solver.start_imu()
                     self.imu_started = True
