@@ -147,7 +147,6 @@ pub use hardware::*;
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 mod stub {
     use crate::imu::{ImuDevice, SensorEvent};
-    use nalgebra::Vector3;
 
     pub struct MpuXxxxDevice;
 
