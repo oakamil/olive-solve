@@ -119,6 +119,12 @@ pub struct SensorData {
     pub motion_state: olive_imu::MotionState,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TargetCamRay {
+    vec: [f64; 3],
+    is_mirrored: bool,
+}
+
 /// The unified solver coordinating tetra3 plate solving and olive-imu hardware tracking.
 /// Handles coordinate transformations between the equatorial and local horizontal frames.
 pub struct FusedSolver {
@@ -129,6 +135,7 @@ pub struct FusedSolver {
     imu_type: Arc<RwLock<ImuType>>,
     storage: Option<Arc<dyn PersistentStorage>>,
     latest_solve_position: Arc<RwLock<Option<Position>>>,
+    target_cam_vector: Arc<RwLock<Option<TargetCamRay>>>,
     last_solve_failed: Arc<RwLock<bool>>,
     enable_accel: bool,
 
@@ -173,6 +180,7 @@ impl FusedSolver {
             imu_type: Arc::new(RwLock::new(imu_type.unwrap_or(ImuType::Auto))),
             storage,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            target_cam_vector: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
             enable_accel,
             latitude: Arc::new(RwLock::new(None)),
@@ -851,9 +859,34 @@ impl FusedSolver {
         (ra, dec)
     }
 
+    #[inline]
+    fn extract_optical_center_coords(solution: &Solution) -> (f64, f64) {
+        match (solution.ra, solution.dec) {
+            (Some(ra), Some(dec)) => (ra, dec),
+            _ => Self::extract_pointing_coords(solution),
+        }
+    }
+
     fn update_anchor_internal(&self, solution: &Solution, time: SystemTime, pointing_only: bool) {
-        let (ra, dec) = Self::extract_pointing_coords(solution);
+        let (pointing_ra, pointing_dec) = Self::extract_pointing_coords(solution);
+        let (opt_ra, opt_dec) = Self::extract_optical_center_coords(solution);
         let roll = solution.roll.unwrap_or(0.0);
+
+        let target_vec = match (
+            solution.ra,
+            solution.dec,
+            solution.target_ra.as_ref().and_then(|v| v.first().copied()),
+            solution
+                .target_dec
+                .as_ref()
+                .and_then(|v| v.first().copied()),
+        ) {
+            (Some(ora), Some(odec), Some(tra), Some(tdec)) => Some(TargetCamRay {
+                vec: celestial_to_camera_vector(tra, tdec, ora, odec, roll, solution.is_mirrored),
+                is_mirrored: solution.is_mirrored,
+            }),
+            _ => None,
+        };
 
         if let Some(ref imu) = *self.imu.read().unwrap() {
             let lat_opt = *self.latitude.read().unwrap();
@@ -862,7 +895,7 @@ impl FusedSolver {
             if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
                 let dt: chrono::DateTime<chrono::Utc> = time.into();
 
-                let (alt, az, alt_az_roll) = ra_dec_to_alt_az(ra, dec, roll, lat, lon, dt);
+                let (alt, az, alt_az_roll) = ra_dec_to_alt_az(opt_ra, opt_dec, roll, lat, lon, dt);
 
                 let mount_coords = MountCoordinates {
                     pitch: alt,
@@ -885,9 +918,10 @@ impl FusedSolver {
             }
         }
 
+        *self.target_cam_vector.write().unwrap() = target_vec;
         *self.latest_solve_position.write().unwrap() = Some(Position {
-            ra,
-            dec,
+            ra: pointing_ra,
+            dec: pointing_dec,
             roll,
             is_mirrored: solution.is_mirrored,
             source: PositionSource::Solver,
@@ -973,7 +1007,7 @@ impl FusedSolver {
         time: SystemTime,
         max_dist_deg: f64,
     ) -> Option<bool> {
-        let (ra, dec) = Self::extract_pointing_coords(solution);
+        let (ra, dec) = Self::extract_optical_center_coords(solution);
 
         let imu_guard = self.imu.read().unwrap();
         if let Some(ref imu) = *imu_guard {
@@ -1058,6 +1092,7 @@ impl FusedSolver {
     /// Otherwise, it safely falls back to returning the position from the last successful plate solve.
     pub fn get_latest_position(&self) -> Option<Position> {
         let mut last_solve = self.latest_solve_position.read().unwrap().clone();
+        let target_vec = *self.target_cam_vector.read().unwrap();
         let last_failed = *self.last_solve_failed.read().unwrap();
 
         if let Some(ref imu) = *self.imu.read().unwrap() {
@@ -1067,7 +1102,7 @@ impl FusedSolver {
 
                 if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
                     let dt_now = chrono::Utc::now();
-                    let (current_ra, current_dec, current_roll) =
+                    let (opt_ra, opt_dec, current_roll) =
                         alt_az_to_ra_dec(est.pitch, est.yaw, est.roll, lat, lon, dt_now);
 
                     let source = if is_imu_estimate {
@@ -1083,6 +1118,16 @@ impl FusedSolver {
                     };
 
                     let is_mirrored = last_solve.as_ref().map(|p| p.is_mirrored).unwrap_or(false);
+                    let (current_ra, current_dec) = match target_vec {
+                        Some(ref ray) => camera_vector_to_ra_dec(
+                            &ray.vec,
+                            opt_ra,
+                            opt_dec,
+                            current_roll,
+                            ray.is_mirrored,
+                        ),
+                        None => (opt_ra, opt_dec),
+                    };
                     return Some(Position {
                         ra: current_ra,
                         dec: current_dec,
@@ -1103,6 +1148,90 @@ impl FusedSolver {
 
         last_solve
     }
+}
+
+// ==========================================
+// CAMERA <-> CELESTIAL TARGET PROJECTIONS
+// ==========================================
+
+/// Computes the orthonormal camera basis `(boresight, image_left, image_up)` in J2000 equatorial
+/// coordinates matching `tetra3`'s rotation matrix convention.
+fn camera_basis_celestial(
+    ra_deg: f64,
+    dec_deg: f64,
+    roll_deg: f64,
+    is_mirrored: bool,
+) -> ([f64; 3], [f64; 3], [f64; 3]) {
+    let ra = ra_deg.to_radians();
+    let dec = dec_deg.to_radians();
+    let roll = roll_deg.to_radians();
+
+    let (sin_ra, cos_ra) = ra.sin_cos();
+    let (sin_dec, cos_dec) = dec.sin_cos();
+    let (sin_roll, cos_roll) = roll.sin_cos();
+
+    let b0 = [cos_dec * cos_ra, cos_dec * sin_ra, sin_dec];
+    let u_east = [-sin_ra, cos_ra, 0.0];
+    let u_north = [-sin_dec * cos_ra, -sin_dec * sin_ra, cos_dec];
+
+    let mirror_sign = if is_mirrored { -1.0 } else { 1.0 };
+    let b1 = [
+        mirror_sign * (cos_roll * u_east[0] + sin_roll * u_north[0]),
+        mirror_sign * (cos_roll * u_east[1] + sin_roll * u_north[1]),
+        mirror_sign * (cos_roll * u_east[2] + sin_roll * u_north[2]),
+    ];
+    let b2 = [
+        -sin_roll * u_east[0] + cos_roll * u_north[0],
+        -sin_roll * u_east[1] + cos_roll * u_north[1],
+        -sin_roll * u_east[2] + cos_roll * u_north[2],
+    ];
+    (b0, b1, b2)
+}
+
+/// Converts a solved target sky coordinate into a unit direction vector in the camera's local frame.
+fn celestial_to_camera_vector(
+    target_ra_deg: f64,
+    target_dec_deg: f64,
+    opt_ra_deg: f64,
+    opt_dec_deg: f64,
+    opt_roll_deg: f64,
+    is_mirrored: bool,
+) -> [f64; 3] {
+    let tr = target_ra_deg.to_radians();
+    let td = target_dec_deg.to_radians();
+    let (sin_tr, cos_tr) = tr.sin_cos();
+    let (sin_td, cos_td) = td.sin_cos();
+    let u_tgt = [cos_td * cos_tr, cos_td * sin_tr, sin_td];
+
+    let (b0, b1, b2) = camera_basis_celestial(opt_ra_deg, opt_dec_deg, opt_roll_deg, is_mirrored);
+    let v0 = u_tgt[0] * b0[0] + u_tgt[1] * b0[1] + u_tgt[2] * b0[2];
+    let v1 = u_tgt[0] * b1[0] + u_tgt[1] * b1[1] + u_tgt[2] * b1[2];
+    let v2 = u_tgt[0] * b2[0] + u_tgt[1] * b2[1] + u_tgt[2] * b2[2];
+
+    let norm = (v0 * v0 + v1 * v1 + v2 * v2).sqrt();
+    if norm > 0.0 {
+        [v0 / norm, v1 / norm, v2 / norm]
+    } else {
+        [1.0, 0.0, 0.0]
+    }
+}
+
+/// Projects a camera-frame unit direction vector into J2000 `(ra_deg, dec_deg)` given the camera's
+/// optical-center attitude.
+fn camera_vector_to_ra_dec(
+    v_cam: &[f64; 3],
+    opt_ra_deg: f64,
+    opt_dec_deg: f64,
+    opt_roll_deg: f64,
+    is_mirrored: bool,
+) -> (f64, f64) {
+    let (b0, b1, b2) = camera_basis_celestial(opt_ra_deg, opt_dec_deg, opt_roll_deg, is_mirrored);
+    let ux = v_cam[0] * b0[0] + v_cam[1] * b1[0] + v_cam[2] * b2[0];
+    let uy = v_cam[0] * b0[1] + v_cam[1] * b1[1] + v_cam[2] * b2[1];
+    let uz = v_cam[0] * b0[2] + v_cam[1] * b1[2] + v_cam[2] * b2[2];
+    let ra = uy.atan2(ux).to_degrees().rem_euclid(360.0);
+    let dec = uz.atan2(ux.hypot(uy)).to_degrees();
+    (ra, dec)
 }
 
 // ==========================================
@@ -1275,6 +1404,7 @@ mod tests {
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            target_cam_vector: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
             enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
@@ -1299,6 +1429,7 @@ mod tests {
             imu_type: Arc::new(RwLock::new(ImuType::Custom(Box::new(MockImu)))),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            target_cam_vector: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
             enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
@@ -1323,6 +1454,7 @@ mod tests {
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            target_cam_vector: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
             enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
@@ -1343,6 +1475,7 @@ mod tests {
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            target_cam_vector: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
             enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
@@ -1369,6 +1502,7 @@ mod tests {
                 source: PositionSource::Solver,
                 timestamp: std::time::SystemTime::UNIX_EPOCH,
             }))),
+            target_cam_vector: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
             enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
@@ -1418,6 +1552,7 @@ mod tests {
             imu_type: Arc::new(RwLock::new(ImuType::Custom(Box::new(MockImu)))),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            target_cam_vector: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
             enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
@@ -1457,6 +1592,7 @@ mod tests {
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            target_cam_vector: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
             enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
@@ -1486,6 +1622,7 @@ mod tests {
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            target_cam_vector: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
             enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
@@ -1511,6 +1648,7 @@ mod tests {
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            target_cam_vector: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
             enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
@@ -1763,6 +1901,7 @@ mod new_tests {
             imu_type: Arc::new(RwLock::new(ImuType::Custom(Box::new(MockImuWithData)))),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            target_cam_vector: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(false)),
             enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
@@ -1844,6 +1983,7 @@ mod new_tests {
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            target_cam_vector: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(true)), // Simulate previous failure
             enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
@@ -1876,6 +2016,7 @@ mod new_tests {
             imu_type: Arc::new(RwLock::new(ImuType::None)),
             storage: None,
             latest_solve_position: Arc::new(RwLock::new(None)),
+            target_cam_vector: Arc::new(RwLock::new(None)),
             last_solve_failed: Arc::new(RwLock::new(true)),
             enable_accel: true,
             latitude: Arc::new(RwLock::new(None)),
@@ -1899,5 +2040,178 @@ mod new_tests {
         assert_eq!(pos.dec, -15.2);
         assert_eq!(pos.roll, 45.0);
         assert_eq!(pos.source, PositionSource::Solver);
+    }
+
+    #[test]
+    fn test_camera_target_projection_roundtrip_and_roll() {
+        for is_mirrored in [false, true] {
+            let (opt_ra, opt_dec) = (120.0, 35.0);
+            let (init_target_ra, init_target_dec) = (120.0, 45.0);
+
+            let v_cam = celestial_to_camera_vector(
+                init_target_ra,
+                init_target_dec,
+                opt_ra,
+                opt_dec,
+                0.0,
+                is_mirrored,
+            );
+            assert!(v_cam[1].abs() < 1e-12 && v_cam[2] > 0.0);
+
+            let (rt_ra, rt_dec) =
+                camera_vector_to_ra_dec(&v_cam, opt_ra, opt_dec, 0.0, is_mirrored);
+            assert!(angular_separation_deg(init_target_ra, init_target_dec, rt_ra, rt_dec) < 1e-10);
+
+            // +90 deg camera roll revolves North target (+b2) Westward (-u_east) along a 10 deg arc
+            let (rolled_ra, rolled_dec) =
+                camera_vector_to_ra_dec(&v_cam, opt_ra, opt_dec, 90.0, is_mirrored);
+            assert!(rolled_ra < opt_ra);
+            assert!((angular_separation_deg(opt_ra, opt_dec, rolled_ra, rolled_dec) - 10.0).abs() < 1e-9);
+            let expected_chord = 2.0
+                * (10.0_f64.to_radians().sin() * std::f64::consts::FRAC_PI_4.sin())
+                    .asin()
+                    .to_degrees();
+            assert!(
+                (angular_separation_deg(init_target_ra, init_target_dec, rolled_ra, rolled_dec)
+                    - expected_chord)
+                    .abs()
+                    < 1e-9
+            );
+
+            let v_east =
+                celestial_to_camera_vector(130.0, opt_dec, opt_ra, opt_dec, 0.0, is_mirrored);
+            assert!(if is_mirrored { v_east[1] < 0.0 } else { v_east[1] > 0.0 });
+        }
+    }
+
+    #[test]
+    fn test_target_pixel_changes_preserve_imu_optical_center_and_calibration() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SeededIdentityCal;
+        impl PersistentStorage for SeededIdentityCal {
+            fn get(&self, key: &str) -> Option<String> {
+                (key == "imu_calibration").then(|| "0.0,0.0,0.0,1.0,0.50".to_string())
+            }
+            fn set(&self, _key: &str, _value: &str) {}
+            fn remove(&self, _key: &str) {}
+        }
+
+        struct RollableImu(Arc<AtomicUsize>);
+        impl ImuDevice for RollableImu {
+            fn init(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn poll(&mut self) -> Result<Vec<olive_imu::SensorEvent>, String> {
+                let rem = self.0.load(Ordering::SeqCst);
+                let gx = if rem > 0
+                    && self
+                        .0
+                        .compare_exchange(rem, rem - 1, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    std::f64::consts::FRAC_PI_2 / 0.1
+                } else {
+                    0.0
+                };
+                Ok(vec![olive_imu::SensorEvent {
+                    gyro: Some(nalgebra::Vector3::new(gx, 0.0, 0.0)),
+                    dt: Some(0.01),
+                    ..Default::default()
+                }])
+            }
+            fn revive(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let roll_steps = Arc::new(AtomicUsize::new(0));
+        let fs = FusedSolver {
+            solver: Arc::new(RwLock::new(None)),
+            extractor: Arc::new(RwLock::new(None)),
+            fast_extractor: Arc::new(RwLock::new(None)),
+            imu: Arc::new(RwLock::new(None)),
+            imu_type: Arc::new(RwLock::new(ImuType::Custom(Box::new(RollableImu(
+                roll_steps.clone(),
+            ))))),
+            storage: Some(Arc::new(SeededIdentityCal)),
+            latest_solve_position: Arc::new(RwLock::new(None)),
+            target_cam_vector: Arc::new(RwLock::new(None)),
+            last_solve_failed: Arc::new(RwLock::new(false)),
+            enable_accel: false,
+            latitude: Arc::new(RwLock::new(None)),
+            longitude: Arc::new(RwLock::new(None)),
+        };
+
+        fs.set_observer_location(34.0, -118.0);
+        fs.start_imu().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3150));
+
+        let make_sol = |ra, dec, roll, target: Option<(f64, f64)>, status| Solution {
+            ra: Some(ra),
+            dec: Some(dec),
+            roll: Some(roll),
+            target_ra: target.map(|(tra, _)| vec![tra]),
+            target_dec: target.map(|(_, tdec)| vec![tdec]),
+            status,
+            ..Default::default()
+        };
+
+        // 1. Anchor with target #1 (+12 deg North of optical center)
+        fs.update_anchor_from_solution(
+            &make_sol(100.0, 40.0, 0.0, Some((100.0, 52.0)), SolveStatus::MatchFound),
+            SystemTime::now(),
+        );
+        let pos1 = fs.get_latest_position().unwrap();
+        assert!(angular_separation_deg(pos1.ra, pos1.dec, 100.0, 52.0) < 0.05);
+
+        // 2. Jump target by 24 deg to target #2 (-12 deg South): LowConfidenceMatch still verifies via optical center
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let t1 = SystemTime::now();
+        let low_conf = make_sol(
+            101.0,
+            40.5,
+            0.0,
+            Some((101.0, 28.5)),
+            SolveStatus::LowConfidenceMatch,
+        );
+        assert_eq!(
+            fs.verify_solution_with_imu(&low_conf, t1, LOW_CONFIDENCE_MATCH_DEVIATION_TOLERANCE_DEG),
+            Some(true)
+        );
+
+        fs.update_anchor_from_solution(
+            &make_sol(100.0, 40.0, 0.0, Some((100.0, 28.0)), SolveStatus::MatchFound),
+            t1,
+        );
+        let pos2 = fs.get_latest_position().unwrap();
+        assert!(angular_separation_deg(pos2.ra, pos2.dec, 100.0, 28.0) < 0.05);
+
+        // 3. Roll +90 deg around optical axis via IMU: South target revolves Eastward (RA > 100)
+        roll_steps.store(10, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(350));
+
+        let pos_rolled = fs.get_latest_position().unwrap();
+        assert_eq!(pos_rolled.source, PositionSource::Imu);
+        let v_sol2 = celestial_to_camera_vector(100.0, 28.0, 100.0, 40.0, 0.0, false);
+        let (exp_ra, exp_dec) = camera_vector_to_ra_dec(&v_sol2, 100.0, 40.0, 90.0, false);
+        assert!(pos_rolled.ra > 100.0);
+        assert!(angular_separation_deg(pos_rolled.ra, pos_rolled.dec, exp_ra, exp_dec) < 0.3);
+
+        // 4. Post-roll solve with another target jump records near-zero optical-center IMU error
+        fs.update_anchor_from_solution(
+            &make_sol(100.0, 40.0, 90.0, Some((115.0, 40.0)), SolveStatus::MatchFound),
+            SystemTime::now(),
+        );
+        assert!(fs.get_calibration_status().unwrap().transform_error_fraction < 0.05);
+
+        // 5. Clearing target_pixel reverts get_latest_position() to optical center
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        fs.update_anchor_from_solution(
+            &make_sol(100.0, 40.0, 90.0, None, SolveStatus::MatchFound),
+            SystemTime::now(),
+        );
+        let pos_cleared = fs.get_latest_position().unwrap();
+        assert!(angular_separation_deg(pos_cleared.ra, pos_cleared.dec, 100.0, 40.0) < 0.05);
     }
 }
