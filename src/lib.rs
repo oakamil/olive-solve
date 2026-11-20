@@ -92,6 +92,10 @@ pub struct Position {
     pub ra: f64,
     /// Declination in degrees.
     pub dec: f64,
+    /// Optical center Right Ascension in degrees (where `roll` is defined).
+    pub center_ra: f64,
+    /// Optical center Declination in degrees (where `roll` is defined).
+    pub center_dec: f64,
     /// Roll in degrees.
     pub roll: f64,
     /// True if the field was solved under mirrored (horizontally flipped) optical parity.
@@ -922,6 +926,8 @@ impl FusedSolver {
         *self.latest_solve_position.write().unwrap() = Some(Position {
             ra: pointing_ra,
             dec: pointing_dec,
+            center_ra: opt_ra,
+            center_dec: opt_dec,
             roll,
             is_mirrored: solution.is_mirrored,
             source: PositionSource::Solver,
@@ -1131,6 +1137,8 @@ impl FusedSolver {
                     return Some(Position {
                         ra: current_ra,
                         dec: current_dec,
+                        center_ra: opt_ra,
+                        center_dec: opt_dec,
                         roll: current_roll,
                         is_mirrored,
                         source,
@@ -1497,6 +1505,8 @@ mod tests {
             latest_solve_position: Arc::new(RwLock::new(Some(Position {
                 ra: 10.0,
                 dec: 20.0,
+                center_ra: 11.0,
+                center_dec: 21.0,
                 roll: 0.0,
                 is_mirrored: false,
                 source: PositionSource::Solver,
@@ -1513,6 +1523,8 @@ mod tests {
         assert!(pos.is_some());
         let pos = pos.unwrap();
         assert_eq!(pos.ra, 10.0);
+        assert_eq!(pos.center_ra, 11.0);
+        assert_eq!(pos.center_dec, 21.0);
         assert_eq!(pos.source, PositionSource::Solver);
     }
 
@@ -2066,7 +2078,10 @@ mod new_tests {
             let (rolled_ra, rolled_dec) =
                 camera_vector_to_ra_dec(&v_cam, opt_ra, opt_dec, 90.0, is_mirrored);
             assert!(rolled_ra < opt_ra);
-            assert!((angular_separation_deg(opt_ra, opt_dec, rolled_ra, rolled_dec) - 10.0).abs() < 1e-9);
+            assert!(
+                (angular_separation_deg(opt_ra, opt_dec, rolled_ra, rolled_dec) - 10.0).abs()
+                    < 1e-9
+            );
             let expected_chord = 2.0
                 * (10.0_f64.to_radians().sin() * std::f64::consts::FRAC_PI_4.sin())
                     .asin()
@@ -2080,7 +2095,11 @@ mod new_tests {
 
             let v_east =
                 celestial_to_camera_vector(130.0, opt_dec, opt_ra, opt_dec, 0.0, is_mirrored);
-            assert!(if is_mirrored { v_east[1] < 0.0 } else { v_east[1] > 0.0 });
+            assert!(if is_mirrored {
+                v_east[1] < 0.0
+            } else {
+                v_east[1] > 0.0
+            });
         }
     }
 
@@ -2159,11 +2178,18 @@ mod new_tests {
 
         // 1. Anchor with target #1 (+12 deg North of optical center)
         fs.update_anchor_from_solution(
-            &make_sol(100.0, 40.0, 0.0, Some((100.0, 52.0)), SolveStatus::MatchFound),
+            &make_sol(
+                100.0,
+                40.0,
+                0.0,
+                Some((100.0, 52.0)),
+                SolveStatus::MatchFound,
+            ),
             SystemTime::now(),
         );
         let pos1 = fs.get_latest_position().unwrap();
         assert!(angular_separation_deg(pos1.ra, pos1.dec, 100.0, 52.0) < 0.05);
+        assert!(angular_separation_deg(pos1.center_ra, pos1.center_dec, 100.0, 40.0) < 0.05);
 
         // 2. Jump target by 24 deg to target #2 (-12 deg South): LowConfidenceMatch still verifies via optical center
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -2176,12 +2202,22 @@ mod new_tests {
             SolveStatus::LowConfidenceMatch,
         );
         assert_eq!(
-            fs.verify_solution_with_imu(&low_conf, t1, LOW_CONFIDENCE_MATCH_DEVIATION_TOLERANCE_DEG),
+            fs.verify_solution_with_imu(
+                &low_conf,
+                t1,
+                LOW_CONFIDENCE_MATCH_DEVIATION_TOLERANCE_DEG
+            ),
             Some(true)
         );
 
         fs.update_anchor_from_solution(
-            &make_sol(100.0, 40.0, 0.0, Some((100.0, 28.0)), SolveStatus::MatchFound),
+            &make_sol(
+                100.0,
+                40.0,
+                0.0,
+                Some((100.0, 28.0)),
+                SolveStatus::MatchFound,
+            ),
             t1,
         );
         let pos2 = fs.get_latest_position().unwrap();
@@ -2193,6 +2229,9 @@ mod new_tests {
 
         let pos_rolled = fs.get_latest_position().unwrap();
         assert_eq!(pos_rolled.source, PositionSource::Imu);
+        assert!(
+            angular_separation_deg(pos_rolled.center_ra, pos_rolled.center_dec, 100.0, 40.0) < 0.3
+        );
         let v_sol2 = celestial_to_camera_vector(100.0, 28.0, 100.0, 40.0, 0.0, false);
         let (exp_ra, exp_dec) = camera_vector_to_ra_dec(&v_sol2, 100.0, 40.0, 90.0, false);
         assert!(pos_rolled.ra > 100.0);
@@ -2200,10 +2239,21 @@ mod new_tests {
 
         // 4. Post-roll solve with another target jump records near-zero optical-center IMU error
         fs.update_anchor_from_solution(
-            &make_sol(100.0, 40.0, 90.0, Some((115.0, 40.0)), SolveStatus::MatchFound),
+            &make_sol(
+                100.0,
+                40.0,
+                90.0,
+                Some((115.0, 40.0)),
+                SolveStatus::MatchFound,
+            ),
             SystemTime::now(),
         );
-        assert!(fs.get_calibration_status().unwrap().transform_error_fraction < 0.05);
+        assert!(
+            fs.get_calibration_status()
+                .unwrap()
+                .transform_error_fraction
+                < 0.05
+        );
 
         // 5. Clearing target_pixel reverts get_latest_position() to optical center
         std::thread::sleep(std::time::Duration::from_millis(30));

@@ -3,11 +3,11 @@
 
 use crate::FusedSolver;
 use numpy::PyReadonlyArray2;
+use olive_imu::storage::{FileStorage, PersistentStorage};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use std::path::PathBuf;
 use std::sync::Arc;
-use olive_imu::storage::{FileStorage, PersistentStorage};
 
 fn default_storage_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
@@ -71,7 +71,9 @@ fn parse_storage<'py>(
     }
 
     if obj.hasattr("get")? && obj.hasattr("set")? && obj.hasattr("remove")? {
-        Ok(Some(Arc::new(PyPersistentStorageAdapter { obj: obj.unbind() })))
+        Ok(Some(Arc::new(PyPersistentStorageAdapter {
+            obj: obj.unbind(),
+        })))
     } else {
         Err(pyo3::exceptions::PyTypeError::new_err(
             "storage must be None (default), bool, str/Path, or an object implementing get(key), set(key, value), and remove(key)",
@@ -442,13 +444,15 @@ impl PyFusedSolver {
     /// Fetches the latest known orientation of the device.
     ///
     /// Returns:
-    ///     dict: Dictionary containing ra, dec, roll, source, timestamp
+    ///     dict: Dictionary containing ra, dec, center_ra, center_dec, roll, source, timestamp
     pub fn get_latest_position<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let maybe_pos = py.detach(|| self.inner.get_latest_position());
         if let Some(pos) = maybe_pos {
             let dict = PyDict::new(py);
             dict.set_item("ra", pos.ra)?;
             dict.set_item("dec", pos.dec)?;
+            dict.set_item("center_ra", pos.center_ra)?;
+            dict.set_item("center_dec", pos.center_dec)?;
             dict.set_item("roll", pos.roll)?;
             dict.set_item("source", format!("{:?}", pos.source))?;
 
